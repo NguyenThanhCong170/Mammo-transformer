@@ -70,7 +70,7 @@ def _build_pixel_pool(level: int) -> list:
         A.GaussNoise(
             var_limit=(level, 8 * level),
             mean=0,
-            per_channel=True,
+            per_channel=False,
             p=PA
         ),
     ]

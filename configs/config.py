@@ -4,9 +4,9 @@ from typing import Tuple
 
 @dataclass
 class DataConfig:
-    data_root: str = "images_cropped"          # root chứa ảnh đã crop
-    csv_path: str = "finding_annotations.csv" # cột: patient_id, laterality, view, image_path, birads
-    image_size: Tuple[int, int] = (512, 512)
+    data_root: str = "images_png"          # root chứa ảnh đã crop
+    csv_path: str = "labels.csv" # cột: patient_id, laterality, view, image_path, birads
+    image_size: Tuple[int, int] = (256, 256)
     num_workers: int = 4
 
     # Split — VinDr-Mammo đã có sẵn cột 'split' (training/test)
@@ -19,8 +19,8 @@ class DataConfig:
     # PA = 0.2*level: level=3 → PA=0.6, balanced cho 5000 patients
 
     # Class definition
-    # Yes = BI-RADS 4, 5  |  No = BI-RADS 1, 2, 3
-    positive_birads: Tuple[int, ...] = (4, 5)
+    # Yes = BI-RADS 3,4, 5  |  No = BI-RADS 1, 2
+    positive_birads: Tuple[int, ...] = (3,4, 5)
 
 
 @dataclass
@@ -50,8 +50,8 @@ class TrainConfig:
     experiment_name: str = "mammo_transformer_v1"
 
     # Training
-    epochs_phase1: int = 10              # Freeze backbone
-    epochs_phase2: int = 50               # Full fine-tune
+    epochs_phase1: int = 10            # Freeze backbone
+    epochs_phase2: int = 100               # Full fine-tune
     batch_size: int = 4                   # 4 ảnh/patient → memory nặng
     accumulate_grad_steps: int = 4        # Effective batch = 16
 

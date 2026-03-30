@@ -1,12 +1,10 @@
 """
-Dataset cho VinDr-Mammo.
+Dataset cho VinDr-Mammo (phiên bản dùng ảnh PNG).
 
 Cấu trúc CSV mong đợi:
   patient_id | image_id | laterality | view_position | image_path | breast_birads
   P001       | img001   | L          | MLO           | /path/.png | BI-RADS 2
-  P001       | img002   | L          | CC            | /path/.png | BI-RADS 2
-  P001       | img003   | R          | MLO           | /path/.png | BI-RADS 4
-  P001       | img004   | R          | CC            | /path/.png | BI-RADS 4
+  ...
 """
 
 import os
@@ -14,11 +12,10 @@ import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import cv2  # Thêm thư viện OpenCV để đọc file PNG
 import numpy as np
 import pandas as pd
-import pydicom
 import torch
-from pydicom.pixel_data_handlers.util import apply_voi_lut
 from torch.utils.data import DataLoader, Dataset
 
 from data.augmentation import build_transforms
@@ -53,7 +50,7 @@ class MammoDataset(Dataset):
         self,
         df: pd.DataFrame,
         image_size: int = 512,
-        positive_birads: Tuple[int, ...] = (4, 5),
+        positive_birads: Tuple[int, ...] = (3,4, 5),
         is_train: bool = True,
         aug_level: int = 3,          # MedAugment level ∈ {1..5}
     ):
@@ -101,7 +98,6 @@ class MammoDataset(Dataset):
                 img = self._load_image(img_path)
             else:
                 # Thiếu view → tạo ảnh đen (padding)
-                # Dùng transform tạo tensor rỗng đúng size
                 img = self._empty_image()
 
             images[key] = img
@@ -114,35 +110,19 @@ class MammoDataset(Dataset):
 
     def _load_image(self, path: str) -> torch.Tensor:
         """
-        Đọc file DICOM → numpy uint8 → transform → Tensor(3,H,W).
-
-        Pipeline xử lý DICOM mammography:
-          1. pydicom đọc pixel_array  → thường là uint16 (12-bit hoặc 16-bit)
-          2. apply_voi_lut            → áp dụng windowing từ DICOM header
-          3. MONOCHROME1 correction   → invert nếu cần (trắng = không có gì)
-          4. Normalize về [0, 255]    → uint8 cho albumentations
-          5. transform (MedAugment hoặc Val) → Tensor(3,H,W)
+        Đọc file PNG -> numpy uint8 -> transform -> Tensor(3,H,W).
         """
-        ds         = pydicom.dcmread(path)
-        pixel      = ds.pixel_array.astype(np.float32)  # (H, W), uint16 range
+        # Đọc ảnh PNG dưới dạng grayscale (1 channel)
+        pixel = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        
+        if pixel is None:
+            raise FileNotFoundError(f"Không thể đọc được ảnh tại: {path}")
 
-        # Áp dụng VOI LUT (Window Center / Window Width từ DICOM header)
-        # → chuẩn hóa về khoảng hiển thị đúng trên màn hình đọc phim
-        pixel = apply_voi_lut(pixel, ds, prefer_lut=True).astype(np.float32)
+        # Đảm bảo ảnh là uint8 (thường cv2 đã trả về uint8 cho ảnh 8-bit)
+        pixel = pixel.astype(np.uint8)
 
-        # MONOCHROME1: pixel cao = tối (ngược với convention thông thường)
-        # MONOCHROME2: pixel cao = sáng (convention chuẩn)
-        if hasattr(ds, "PhotometricInterpretation"):
-            if ds.PhotometricInterpretation == "MONOCHROME1":
-                pixel = pixel.max() - pixel   # invert
-
-        # Normalize về [0, 255] uint8
-        p_min, p_max = pixel.min(), pixel.max()
-        if p_max > p_min:
-            pixel = (pixel - p_min) / (p_max - p_min) * 255.0
-        pixel = pixel.astype(np.uint8)        # (H, W), uint8
-
-        return self.transform(pixel)          # → Tensor(3, H, W)
+        # Trả về qua transform (MedAugment hoặc Val) → Tensor(3, H, W)
+        return self.transform(pixel)
 
     def _empty_image(self) -> torch.Tensor:
         """Tạo ảnh đen khi thiếu view (shape chuẩn để không crash collate)."""
@@ -157,15 +137,10 @@ class MammoDataset(Dataset):
 # ──────────────────────────────────────────────
 # Patient-level Split
 # ──────────────────────────────────────────────
-# ──────────────────────────────────────────────
-# Patient-level Split — dùng cột split gốc của VinDr-Mammo
-# ──────────────────────────────────────────────
 def split_patients(
     df: pd.DataFrame,
-    val_ratio: float = 0.15,
+    val_ratio: float = 0.10,
     seed: int = 42,
-    # Các tham số dưới giữ để tương thích ngược, không dùng nữa
-    train_ratio: float = 0.70,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     VinDr-Mammo đã có sẵn cột 'split' = 'training' | 'test'.
@@ -209,11 +184,10 @@ def build_dataloaders(
     image_size: int = 512,
     batch_size: int = 4,
     num_workers: int = 4,
-    val_ratio: float = 0.15,         # Tỉ lệ val tách từ training set gốc
+    val_ratio: float = 0.10,
     seed: int = 42,
-    positive_birads: Tuple[int, ...] = (4, 5),
+    positive_birads: Tuple[int, ...] = (3,4, 5),
     aug_level: int = 3,
-    train_ratio: float = 0.70,       # Giữ để tương thích ngược, không dùng
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
 
     df = pd.read_csv(csv_path)
@@ -224,7 +198,7 @@ def build_dataloaders(
     if missing:
         raise ValueError(f"CSV thiếu cột: {missing}")
 
-    train_df, val_df, test_df = split_patients(df, val_ratio = val_ratio, seed = seed, train_ratio = train_ratio)
+    train_df, val_df, test_df = split_patients(df, val_ratio = val_ratio, seed = seed)
     print(f"[Dataset] MedAugment level={aug_level}, PA={0.2*aug_level:.1f}")
 
     train_ds = MammoDataset(train_df, image_size, positive_birads, is_train=True,  aug_level=aug_level)

@@ -1,33 +1,20 @@
-"""
-Script chuẩn bị CSV từ VinDr-Mammo raw annotations.
-
-VinDr-Mammo structure (sau khi download):
-  physionet.org/files/vindr-mammo/1.0.0/
-  ├── finding_annotations.csv
-  ├── breast_level_annotations.csv
-  └── images/
-      └── {study_id}/
-          └── {image_id}.dicom  
-"""
-
 import pandas as pd
 import os
 from pathlib import Path
 
 
 def prepare_vindr_csv(
-    breast_annotations_path: str,   # breast_level_annotations.csv
-    images_dir: str,                 # Thư mục chứa ảnh đã crop (.png)
+    breast_annotations_path: str,
+    images_dir: str,
     output_csv_path: str,
-    image_ext: str = ".dicom",
+    image_ext: str = ".png",
 ):
-    """
-    breast_level_annotations.csv columns:
-        study_id, laterality, view_position,
-        breast_birads, breast_density
-    """
     df = pd.read_csv(breast_annotations_path)
     print(f"Raw annotations: {len(df)} rows, {df['study_id'].nunique()} studies")
+
+    # Xóa các dòng có image_id trùng lặp, giữ lại dòng đầu tiên xuất hiện
+    df = df.drop_duplicates(subset=["image_id"], keep="first")
+    print(f"Sau khi xóa lặp theo image_id: {len(df)} rows")
 
     # Rename study_id → patient_id cho nhất quán
     df = df.rename(columns={"study_id": "patient_id"})
@@ -37,7 +24,6 @@ def prepare_vindr_csv(
     df["view_position"]  = df["view_position"].str.strip().str.upper() # MLO / CC
 
     # Tạo đường dẫn ảnh
-    # Giả sử bạn đã lưu ảnh theo: {images_dir}/{patient_id}/{image_id}.png
     def build_path(row):
         path = Path(images_dir) / row["patient_id"] / f"{row['image_id']}{image_ext}"
         return str(path.as_posix())
@@ -57,8 +43,21 @@ def prepare_vindr_csv(
     view_counts = df.groupby("patient_id").apply(
         lambda g: len(set(zip(g["laterality"], g["view_position"])))
     )
+    
     complete = view_counts[view_counts == 4].index
     print(f"Patients với đủ 4 views: {len(complete)} / {df['patient_id'].nunique()}")
+
+    # ================== THÊM ĐOẠN NÀY ==================
+    incomplete = view_counts[view_counts != 4].index
+    if len(incomplete) > 0:
+        print(f"⚠️ WARNING: Có {len(incomplete)} bệnh nhân không đủ 4 views!")
+        print(f"Danh sách patient_id bị thiếu views: {list(incomplete)}")
+        
+        # (Tùy chọn) In chi tiết bệnh nhân đó đang có những views nào
+        for pid in incomplete:
+            views_hien_co = df[df['patient_id'] == pid][['laterality', 'view_position']].values.tolist()
+            print(f"  - Bệnh nhân {pid} hiện chỉ có {len(views_hien_co)} views: {views_hien_co}")
+    # ===================================================
 
     df_complete = df[df["patient_id"].isin(complete)].copy()
 
@@ -69,7 +68,7 @@ def prepare_vindr_csv(
 
     # Label
     df_complete["label"] = df_complete["birads_int"].apply(
-        lambda x: 1 if x in [4, 5] else 0
+        lambda x: 1 if x in [3, 4, 5] else 0
     )
 
     # Class distribution
@@ -77,13 +76,13 @@ def prepare_vindr_csv(
     pos = patient_labels.sum()
     neg = len(patient_labels) - pos
     print(f"\nClass distribution (patient-level):")
-    print(f"  Positive (BI-RADS 4,5): {pos} ({pos/len(patient_labels)*100:.1f}%)")
-    print(f"  Negative (BI-RADS 1-3): {neg} ({neg/len(patient_labels)*100:.1f}%)")
+    print(f"  Positive (BI-RADS 3,4,5): {pos} ({pos/len(patient_labels)*100:.1f}%)")
+    print(f"  Negative (BI-RADS 1,2): {neg} ({neg/len(patient_labels)*100:.1f}%)") # Sửa lại text in ra cho chuẩn
 
     # Save
     output_cols = [
         "patient_id", "image_id", "laterality", "view_position",
-        "image_path", "breast_birads", "birads_int", "label", "split"  # ← giữ cột split gốc
+        "image_path", "breast_birads", "birads_int", "label", "split"
     ]
     df_complete[output_cols].to_csv(output_csv_path, index=False)
     print(f"\n✅ Saved: {output_csv_path} ({len(df_complete)} rows)")
@@ -94,7 +93,7 @@ def prepare_vindr_csv(
 if __name__ == "__main__":
     prepare_vindr_csv(
         breast_annotations_path="finding_annotations.csv",
-        images_dir="images_cropped",
+        images_dir="images_png",
         output_csv_path="labels.csv",
-        image_ext=".dicom",
+        image_ext=".png",
     )
