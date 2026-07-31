@@ -96,7 +96,7 @@ class TrainConfig:
     pretrained_phase1: bool = True          # khởi tạo từ ImageNet
     # Contrastive: batch CÀNG LỚN CÀNG TỐT (negative = 4*(B-1) mỗi anchor).
     # Đo trên A40 dùng chung ~22 GB. Chạy lại find_batch_size.py nếu GPU trống hơn.
-    batch_size_phase1: int = 8              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
+    batch_size_phase1: int = 12              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
     lr_phase1: float = 1e-4
     temperature: float = 0.1
     proj_hidden_dim: int = 2048
