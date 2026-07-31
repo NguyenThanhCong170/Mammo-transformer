@@ -2,13 +2,16 @@
 Smoke test — chạy TRƯỚC khi train để bắt lỗi shape/API trong ~1 phút,
 thay vì đợi 20 phút load data rồi mới crash.
 
-    python smoke_test.py            # test model + loss (không cần dataset)
-    python smoke_test.py --data     # test thêm dataloader (cần labels.csv + ảnh)
+    python smoke_test.py                  # tự dùng GPU nếu có
+    python smoke_test.py --device cpu     # ép chạy CPU
+    python smoke_test.py --data           # test thêm dataloader (cần CSV + ảnh)
+    python smoke_test.py --full-size      # dùng đúng image_size thật
 
-Không cần GPU. Dùng ảnh nhỏ hơn để chạy nhanh trên CPU.
+Trên server có GPU cứ để mặc định — nhanh hơn CPU hàng chục lần.
 """
 
 import argparse
+import time
 import traceback
 
 import torch
@@ -23,22 +26,33 @@ VIEW_KEYS = ["L_MLO", "L_CC", "R_MLO", "R_CC"]
 OK, FAIL = "  ✔", "  ✘"
 
 
+def _sync():
+    """CUDA chạy bất đồng bộ — phải sync trước khi đo thời gian, nếu không
+    con số đo được chỉ là thời gian xếp lệnh vào queue, không phải thời gian chạy."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _report(name, fn):
     print(f"\n▶ {name}")
+    _sync()
+    t0 = time.time()
     try:
         fn()
-        print(f"{OK} PASS")
+        _sync()
+        print(f"{OK} PASS  ({time.time()-t0:.1f}s)")
         return True
     except Exception:
-        print(f"{FAIL} FAIL")
+        _sync()
+        print(f"{FAIL} FAIL  ({time.time()-t0:.1f}s)")
         traceback.print_exc()
         return False
 
 
-def test_backbone_tokens(cfg, img_size):
+def test_backbone_tokens(cfg, img_size, device):
     bb = SwinV2Backbone(cfg.model.backbone_name, pretrained=False,
-                        img_size=img_size, token_grid=cfg.model.token_grid)
-    x = torch.randn(2, 3, *img_size)
+                        img_size=img_size, token_grid=cfg.model.token_grid).to(device)
+    x = torch.randn(2, 3, *img_size, device=device)
     pooled = bb(x)
     tokens = bb.forward_tokens(x)
     print(f"    pooled : {tuple(pooled.shape)}  (kỳ vọng (2, {bb.out_dim}))")
@@ -49,7 +63,7 @@ def test_backbone_tokens(cfg, img_size):
     assert tokens.shape[1] > 1, "N == 1 → softmax của attention luôn = 1.0, attention vô dụng!"
 
 
-def test_model_forward(cfg, img_size):
+def test_model_forward(cfg, img_size, device):
     model = MammoTransformer(
         backbone_name=cfg.model.backbone_name,
         backbone_pretrained=False,
@@ -64,8 +78,8 @@ def test_model_forward(cfg, img_size):
         mlp_dropout=cfg.model.mlp_dropout,
         num_classes=cfg.data.num_classes,
         token_grid=cfg.model.token_grid,
-    )
-    images = {k: torch.randn(2, 3, *img_size) for k in VIEW_KEYS}
+    ).to(device)
+    images = {k: torch.randn(2, 3, *img_size, device=device) for k in VIEW_KEYS}
     logits = model(images)
     print(f"    logits: {tuple(logits.shape)}  (kỳ vọng (2, {cfg.data.num_classes}))")
     assert logits.shape == (2, cfg.data.num_classes)
@@ -79,16 +93,21 @@ def test_model_forward(cfg, img_size):
     assert counts["trainable"] < counts["total"]
 
     # backward chạy được
-    loss = FocalLoss(cfg.train.focal_alpha, cfg.train.focal_gamma, "mean")(
-        model(images), torch.randint(0, 2, (2, cfg.data.num_classes)).float())
+    targets = torch.randint(0, 2, (2, cfg.data.num_classes), device=device).float()
+    loss = FocalLoss(cfg.train.focal_alpha, cfg.train.focal_gamma, "mean").to(device)(
+        model(images), targets)
     loss.backward()
     print(f"    focal loss = {loss.item():.4f}, backward OK")
 
+    if device.type == "cuda":
+        print(f"    VRAM peak: {torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
 
-def test_contrastive(cfg):
+
+def test_contrastive(cfg, device):
     bb_dim, B, V = 1024, 3, 4
-    head = ProjectionHead(bb_dim, cfg.train.proj_hidden_dim, cfg.train.proj_out_dim)
-    feats = torch.randn(B * V, bb_dim)
+    head = ProjectionHead(bb_dim, cfg.train.proj_hidden_dim,
+                          cfg.train.proj_out_dim).to(device)
+    feats = torch.randn(B * V, bb_dim, device=device)
     z = head(feats).reshape(B, V, -1)
     loss = MultiViewNTXentLoss(cfg.train.temperature)(z)
     print(f"    z: {tuple(z.shape)} | NT-Xent loss = {loss.item():.4f}")
@@ -97,7 +116,7 @@ def test_contrastive(cfg):
 
     # batch_size=1 phải báo lỗi rõ ràng thay vì trả nan
     try:
-        MultiViewNTXentLoss()(torch.randn(1, 4, 128))
+        MultiViewNTXentLoss()(torch.randn(1, 4, 128, device=device))
         raise AssertionError("Đáng lẽ phải raise ValueError khi batch_size=1")
     except ValueError:
         print("    batch_size=1 → raise ValueError đúng như mong đợi")
@@ -118,7 +137,7 @@ def test_metrics(cfg):
     assert "macro_ap" in res["macro"]
 
 
-def test_dataloader(cfg):
+def test_dataloader(cfg, device):
     from data.dataset import build_dataloaders
     train_loader, val_loader, test_loader = build_dataloaders(
         csv_path=cfg.data.csv_path,
@@ -140,13 +159,34 @@ def test_dataloader(cfg):
     print(f"    label: {tuple(batch['label'].shape)} | ví dụ: {batch['label'][0].tolist()}")
     assert batch["label"].shape[1] == cfg.data.num_classes
 
+    # chuyển sang device đúng như lúc train
+    images = {k: v.to(device) for k, v in batch["images"].items()}
+    assert images["L_MLO"].device.type == device.type
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", action="store_true", help="test cả dataloader (cần labels.csv)")
     ap.add_argument("--full-size", action="store_true",
                     help="dùng đúng image_size thật (chậm trên CPU)")
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                    help="auto = dùng GPU nếu có")
     args = ap.parse_args()
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("Yêu cầu --device cuda nhưng torch.cuda.is_available() = False")
+
+    if device.type == "cuda":
+        p = torch.cuda.get_device_properties(0)
+        print(f"Device: cuda — {p.name} ({p.total_memory/1024**3:.1f} GB)")
+        torch.cuda.reset_peak_memory_stats()
+    else:
+        print(f"Device: cpu — {torch.get_num_threads()} thread "
+              f"(đặt OMP_NUM_THREADS nếu server bị oversubscribe)")
 
     cfg = Config()
     # 448x224: chọn cho NHANH trên CPU, tỉ lệ dọc gần giống ảnh mammo thật.
@@ -159,14 +199,14 @@ def main():
     print(f"Smoke test — img_size (H, W) = {img_size}, token_grid = {cfg.model.token_grid}")
 
     results = [
-        _report("Backbone → token map", lambda: test_backbone_tokens(cfg, img_size)),
+        _report("Backbone → token map", lambda: test_backbone_tokens(cfg, img_size, device)),
         _report("MammoTransformer forward + freeze + backward",
-                lambda: test_model_forward(cfg, img_size)),
-        _report("ProjectionHead + NT-Xent (phase 1)", lambda: test_contrastive(cfg)),
+                lambda: test_model_forward(cfg, img_size, device)),
+        _report("ProjectionHead + NT-Xent (phase 1)", lambda: test_contrastive(cfg, device)),
         _report("Metrics + threshold search", lambda: test_metrics(cfg)),
     ]
     if args.data:
-        results.append(_report("DataLoader", lambda: test_dataloader(cfg)))
+        results.append(_report("DataLoader", lambda: test_dataloader(cfg, device)))
 
     print("\n" + "=" * 50)
     print(f"  KẾT QUẢ: {sum(results)}/{len(results)} PASS")
