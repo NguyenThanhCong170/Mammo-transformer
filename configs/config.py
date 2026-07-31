@@ -105,7 +105,7 @@ class TrainConfig:
     phase1_ckpt_name: str = "phase1_backbone.pt"
 
     # ── Phase 2: freeze backbone, train attention + MLP
-    epochs_phase2: int = 50
+    epochs_phase2: int = 100
     # Supervised: batch lớn KHÔNG tốt hơn — nó làm GIẢM số bước cập nhật gradient.
     # Với ~3400 bệnh nhân train: eff.batch 16 → 212 step/epoch (10.600 step tổng).
     # Nếu để eff.batch 256 thì chỉ còn 13 step/epoch (650 step) — quá ít để hội tụ.
