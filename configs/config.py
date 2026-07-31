@@ -1,12 +1,33 @@
 from dataclasses import dataclass, field
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, Union
+
+# Thư mục gốc của project (nơi chứa configs/, data/, models/...).
+# Dùng cái này thay vì cwd để `python -m data.prepare_csv` chạy được
+# từ bất kỳ thư mục nào, không phụ thuộc bạn đang đứng ở đâu.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_path(p: Union[str, Path]) -> Path:
+    """Đường dẫn tương đối → tính từ PROJECT_ROOT. Tuyệt đối → giữ nguyên."""
+    p = Path(p)
+    return p if p.is_absolute() else (PROJECT_ROOT / p)
 
 
 @dataclass
 class DataConfig:
-    data_root: str = "images_928x352"           # ảnh đã resize (data/resize_images.py)
+    # ── PIPELINE: crop DICOM → raw_images_dir
+    #              → prepare_csv.py  → csv_raw
+    #              → resize_images.py → data_root + csv_path
+    #
+    # raw_images_dir : ảnh gốc sau crop, ĐẦU VÀO của prepare_csv.py
+    # data_root      : ảnh dùng để TRAIN (sau resize). Hai cái có thể khác nhau!
+    raw_images_dir: str = "images_cropped"      # prepare_csv.py quét thư mục này
+    data_root: str = "images_928x352"           # training đọc thư mục này
+
     raw_annotations_csv: str = "finding_annotations.csv"   # file gốc VinDr
-    csv_path: str = "labels_352x928.csv"        # CSV trỏ sang ảnh 928x352
+    csv_raw: str = "labels.csv"                 # prepare_csv.py ghi ra file này
+    csv_path: str = "labels_352x928.csv"        # resize_images.py ghi ra, training đọc
     image_ext: str = ".png"
 
     # QUY ƯỚC TOÀN DỰ ÁN: image_size LUÔN là (H, W) — giống PyTorch/timm.

@@ -18,7 +18,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from data.augmentation import build_transforms
-from configs.config import Config
+from configs.config import Config, resolve_path
 
 cfg = Config()
 
@@ -110,7 +110,9 @@ class MammoDataset(Dataset):
         }
 
     def _load_image(self, path: str) -> torch.Tensor:
-        img = Image.open(path).convert("L")
+        # image_path trong CSV là tương đối → resolve theo PROJECT_ROOT chứ không
+        # theo cwd, để train chạy được dù bạn đứng ở thư mục nào.
+        img = Image.open(resolve_path(path)).convert("L")
         # Ảnh đã resize sẵn, nhưng vẫn ép đúng size để chắc chắn không lệch shape
         if img.size != (self.image_width, self.image_height):   # PIL dùng (W, H)
             img = img.resize((self.image_width, self.image_height), Image.BILINEAR)
