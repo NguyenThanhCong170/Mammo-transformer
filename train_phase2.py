@@ -19,7 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from configs.config import Config
 from data.dataset import build_dataloaders
 from models.mammo_transformer import MammoTransformer
-from utils.losses import FocalLoss, MetricsCalculator
+from utils.losses import FocalLoss, MultiLabelMetricsCalculator
 
 
 # ──────────────────────────────────────────────
@@ -72,7 +72,7 @@ def train_one_epoch(
 
     model.train()
     total_loss = 0.0
-    metrics_calc = MetricsCalculator()
+    metrics_calc = MultiLabelMetricsCalculator()
     optimizer.zero_grad()
 
     for step, batch in enumerate(loader):
@@ -111,7 +111,7 @@ def train_one_epoch(
 def validate(model, loader, criterion, device) -> dict:
     model.eval()
     total_loss = 0.0
-    metrics_calc = MetricsCalculator()
+    metrics_calc = MultiLabelMetricsCalculator()
 
     for batch in loader:
         images = {k: v.to(device) for k, v in batch["images"].items()}
@@ -125,7 +125,7 @@ def validate(model, loader, criterion, device) -> dict:
         metrics_calc.update(logits, labels)
 
     # Update threshold từ val set
-    optimal_thresh = metrics_calc.find_optimal_threshold()
+    optimal_thresh = metrics_calc.find_optimal_thresholds()
     metrics_calc.threshold = optimal_thresh
 
     metrics = metrics_calc.print_report("Val")
@@ -208,6 +208,7 @@ def train(cfg: Config):
     criterion = FocalLoss(
         alpha=cfg.train.focal_alpha,
         gamma=cfg.train.focal_gamma,
+        reduction = cfg.train.focal_reduction
     )
 
     # ── AMP Scaler

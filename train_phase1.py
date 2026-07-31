@@ -15,14 +15,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 scaler = GradScaler(device="cuda" if device.type == "cuda" else "cpu")
 model = SwinV2Backbone(
         model_name=cfg.model.backbone_name,
-        pretrained=cfg.model.pretrained_phase1,
+        pretrained=cfg.train.pretrained_phase1,
         img_width = cfg.data.image_size[0],
         img_height = cfg.data.image_size[1]
     ).to(device)
 model.train()
 
 
-projection_head = ProjectionHead().to(device)
+projection_head = ProjectionHead(input_dim = model.num_features, hidden_dim = cfg.train.hidden_dim, out_dim = cfg.train.out_dim).to(device)
 projection_head.train()
 
 
@@ -56,7 +56,7 @@ for batch_idx, batch in enumerate(train_loader):
     optimizer.zero_grad()
 
     # 2. Dùng autocast cho FP16
-    with autocast():
+    with autocast(device_type=device):
         # Lấy features từ SwinV2 
         # (Không lo OOM vì đã bật Checkpointing và Freeze)
         features = model.forward(images) # Tùy hàm của thư viện, có thể trả về [32, 1024]

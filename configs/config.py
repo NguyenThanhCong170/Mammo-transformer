@@ -77,7 +77,7 @@ class TrainConfig:
     warmup_steps: int = 100
 
     # Loss
-    focal_alpha: list[float] = [0.25, 0.25, 0.5, 0.25]           # Weight cho positive class
+    focal_alpha: list[float] = field(default_factory = lambda: [0.25, 0.80, 0.85, 0.88])        # Weight cho positive class
     focal_gamma: float = 2.0
     focal_reduction: str = "mean"
 

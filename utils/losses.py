@@ -5,7 +5,6 @@ Loss functions và metrics cho binary mammography classification.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import sigmoid_focal_loss
 from sklearn.metrics import (
     average_precision_score,
     multilabel_confusion_matrix,
@@ -42,14 +41,13 @@ class FocalLoss(nn.Module):
         logits:  (B,) — raw logits (chưa qua sigmoid)
         targets: (B,) — float 0.0 hoặc 1.0
         """
-        loss = sigmoid_focal_loss(
-            logits,
-            targets=targets,       # (B, num_class), multi-hot float32
-            alpha=0.25,
-            gamma=2.0,
-            reduction="mean",
-        )
-        return loss
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction = "none")
+        p = torch.sigmoid(logits)
+        p_t = p*targets + (1-p)*(1-targets)
+        a = self.alpha.to(logits.device)
+        a_t = a*targets + (1-a)*(1-targets)
+        loss = a_t *(1-p_t).pow(self.gamma)*ce
+        return loss.mean()
 
 
 # ──────────────────────────────────────────────

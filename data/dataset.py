@@ -113,8 +113,9 @@ class MammoDataset(Dataset):
         }
 
     def _load_image(self, path: str) -> torch.Tensor:
-        pixel = Image.open(path)
-        return self.transform(pixel)          # → Tensor(3, H, W)
+        img = Image.open(path).convert("L")        # PIL Image, grayscale 1 kênh
+        img_np = np.array(img, dtype=np.uint8)
+        return self.transform(img_np)          # → Tensor(3, H, W)
 
     def _empty_image(self) -> torch.Tensor:
         """Tạo ảnh đen khi thiếu view (shape chuẩn để không crash collate)."""
@@ -193,31 +194,9 @@ def build_dataloaders(
     val_ds   = MammoDataset(val_df,   image_size[0], image_size[1], is_train=False, aug_level=aug_level)
     test_ds  = MammoDataset(test_df,  image_size[0], image_size[1], is_train=False, aug_level=aug_level)
 
-    # Weighted sampler để handle class imbalance
-    train_labels = train_ds.get_labels()
-    labels_np = train_labels.numpy()
-    # 1. Đếm số patient mang mỗi class (đếm theo CỘT, không flatten kiểu cũ)
-    class_counts = labels_np.sum(axis=0)           # shape [num_classes]
-
-    # 2. Tính trọng số cho từng class
-    class_weights = 1.0 / np.where(class_counts == 0, 1, class_counts)
-
-    # 3. Tính trọng số cho TỪNG bức ảnh (sample)
-    sample_weights = []
-    for label_vec in labels_np:
-        active = np.where(label_vec > 0)[0]        # các class index đang bật (=1)
-        if len(active) == 0:
-            w = class_weights[0]                    # fallback: coi như background
-        else:
-            w = max(class_weights[c] for c in active)
-        sample_weights.append(w)
-
-    # 4. Khởi tạo sampler
-    weights_tensor = torch.DoubleTensor(sample_weights)
-    sampler = torch.utils.data.WeightedRandomSampler(weights_tensor, len(weights_tensor))
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, sampler=sampler,
+        train_ds, batch_size=batch_size,
         num_workers=num_workers, pin_memory=True, drop_last=True,
         collate_fn=mammo_collate_fn,
     )

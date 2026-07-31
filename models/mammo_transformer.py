@@ -40,7 +40,7 @@ class SwinV2Backbone(nn.Module):
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
-            img_size=(img_height, img_width),
+            img_size=[img_height, img_width],
             num_classes=0,        # Xóa head classifier
             global_pool="avg",    # Global average pool → (B, C)
         )
@@ -309,7 +309,7 @@ class MammoTransformer(nn.Module):
         self.bilateral_fusion = BilateralFusion(embed_dim, num_heads, num_bilateral_layers, attn_dropout)
 
         # ── Classifier
-        self.classifier = MLPClassifier(embed_dim, mlp_hidden_dim, mlp_dropout)
+        self.classifier = MLPClassifier(embed_dim, mlp_hidden_dim, mlp_dropout, 4)
 
         self._init_non_backbone_weights()
 
