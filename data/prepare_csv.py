@@ -20,7 +20,7 @@ def prepare_vindr_csv(
     """
     df = pd.read_csv(breast_annotations_path)
     print(f"Raw annotations: {len(df)} rows, {df['study_id'].nunique()} studies")
-
+    df = df[df["study_id"] != "dbca9d28baa3207b3187c4d07dc81a80"]
     # Rename study_id → patient_id cho nhất quán
     df = df.rename(columns={"study_id": "patient_id"})
 
@@ -45,9 +45,10 @@ def prepare_vindr_csv(
     df = df[df["file_exists"]].drop(columns=["file_exists"])
 
     # Đảm bảo đủ 4 views mỗi bệnh nhân
-    view_counts = df.groupby("patient_id").apply(
-        lambda g: len(set(zip(g["laterality"], g["view_position"])))
-    )
+    # (dùng nunique trên cột ghép — tránh DeprecationWarning của groupby.apply ở pandas 2.2+)
+    df["_view_key"] = df["laterality"] + "_" + df["view_position"]
+    view_counts = df.groupby("patient_id")["_view_key"].nunique()
+    df = df.drop(columns=["_view_key"])
     complete = view_counts[view_counts == 4].index
     print(f"Patients với đủ 4 views: {len(complete)} / {df['patient_id'].nunique()}")
 
@@ -95,10 +96,11 @@ def prepare_vindr_csv(
 
 
 if __name__ == "__main__":
+    # Input = file annotation GỐC của VinDr; output = labels.csv mà dataset.py đọc.
     prepare_vindr_csv(
-        breast_annotations_path= cfg.data.csv_path,
-        images_dir= cfg.data.data_root,
-        output_csv_path= "labels.csv",
-        image_ext= cfg.data.image_ext,
-        label_mapping = cfg.data.label_mapping
+        breast_annotations_path=cfg.data.raw_annotations_csv,
+        images_dir=cfg.data.data_root,
+        output_csv_path=cfg.data.csv_path,
+        image_ext=cfg.data.image_ext,
+        label_mapping=cfg.data.label_mapping,
     )

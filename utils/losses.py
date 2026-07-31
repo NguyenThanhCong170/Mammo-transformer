@@ -30,24 +30,35 @@ class FocalLoss(nn.Module):
     gamma: focusing parameter (2.0 là standard)
     """
 
-    def __init__(self, alpha: float, gamma: float, reduction: str):
+    def __init__(self, alpha, gamma: float = 2.0, reduction: str = "mean"):
         super().__init__()
-        self.alpha = alpha
+        # alpha có thể là scalar hoặc list độ dài num_classes (per-class weight)
+        self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
         self.gamma = gamma
+        assert reduction in ("mean", "sum", "none"), f"reduction lạ: {reduction}"
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        logits:  (B,) — raw logits (chưa qua sigmoid)
-        targets: (B,) — float 0.0 hoặc 1.0
+        logits:  (B, C) — raw logits (chưa qua sigmoid)
+        targets: (B, C) — float 0.0 / 1.0 multi-hot
         """
-        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction = "none")
+        # ép float32: dưới AMP, logits là fp16 và (1-p_t)^gamma dễ underflow về 0
+        logits = logits.float()
+        targets = targets.float()
+
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         p = torch.sigmoid(logits)
-        p_t = p*targets + (1-p)*(1-targets)
-        a = self.alpha.to(logits.device)
-        a_t = a*targets + (1-a)*(1-targets)
-        loss = a_t *(1-p_t).pow(self.gamma)*ce
-        return loss.mean()
+        p_t = p * targets + (1 - p) * (1 - targets)
+        a = self.alpha.to(logits.device)          # (C,) broadcast trên chiều class
+        a_t = a * targets + (1 - a) * (1 - targets)
+        loss = a_t * (1 - p_t).pow(self.gamma) * ce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 # ──────────────────────────────────────────────
@@ -162,9 +173,19 @@ class MultiLabelMetricsCalculator:
                 best_thresholds.append(self.threshold)  # fallback nếu class không đủ 2 lớp
                 continue
             fpr, tpr, thr = roc_curve(y_true_c, probs[:, c])
+
+            # sklearn >= 1.3 đặt thr[0] = np.inf (điểm "không dự đoán gì là positive").
+            # Nếu không lọc, argmax có thể chọn đúng phần tử này → threshold = inf
+            # → mọi prediction thành 0 và sensitivity tụt về 0 ở epoch đó.
+            finite = np.isfinite(thr)
+            if not finite.any():
+                best_thresholds.append(self.threshold)
+                continue
+            fpr, tpr, thr = fpr[finite], tpr[finite], thr[finite]
+
             j_scores = tpr - fpr
-            best_idx = np.argmax(j_scores)
-            best_thresholds.append(float(thr[best_idx]))
+            best = float(thr[np.argmax(j_scores)])
+            best_thresholds.append(float(np.clip(best, 1e-4, 1 - 1e-4)))
         return best_thresholds
  
     def print_report(self, split: str = "Val", thresholds: Optional[list[float]] = None):

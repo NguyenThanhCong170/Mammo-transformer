@@ -1,88 +1,88 @@
 """
 Dataset cho VinDr-Mammo.
 
-Cấu trúc CSV mong đợi:
-  patient_id | image_id | laterality | view_position | image_path | breast_birads
-  P001       | img001   | L          | MLO           | /path/.png | BI-RADS 2
-  P001       | img002   | L          | CC            | /path/.png | BI-RADS 2
-  P001       | img003   | R          | MLO           | /path/.png | BI-RADS 4
-  P001       | img004   | R          | CC            | /path/.png | BI-RADS 4
+CSV mong đợi (sinh ra bởi data/prepare_csv.py):
+  patient_id | image_id | image_path | laterality | view_position | target | split
+
+QUY ƯỚC: image_size LUÔN là (H, W).
 """
 
-import os
 import ast
 import random
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from PIL import Image
 
 import numpy as np
 import pandas as pd
-import pydicom
 import torch
-from pydicom.pixel_data_handlers.util import apply_voi_lut
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from data.augmentation import build_transforms
 from configs.config import Config
+
 cfg = Config()
 
-# ──────────────────────────────────────────────
-# View keys chuẩn hóa
-# ──────────────────────────────────────────────
 VIEW_KEYS = ["L_MLO", "L_CC", "R_MLO", "R_CC"]
+VIEW_INDEX = {key: i for i, key in enumerate(VIEW_KEYS)}
 
-VIEW_INDEX = {key: i for i, key in enumerate(VIEW_KEYS)}  # {"L_MLO": 0, ...}
 
 # ──────────────────────────────────────────────
 # Main Dataset
 # ──────────────────────────────────────────────
 class MammoDataset(Dataset):
     """
-    Mỗi sample = 1 bệnh nhân với 4 views.
+    Mỗi sample = 1 bệnh nhân với 4 view.
+
     Trả về:
-        images : Dict[str, Tensor]  — keys: L_MLO, L_CC, R_MLO, R_CC
-        label  : Tensor (0 or 1)
-        patient_id: str
+        images     : Dict[str, Tensor(3, H, W)]
+        label      : Tensor(num_classes,) multi-hot float
+        patient_id : str
     """
 
     def __init__(
         self,
         df: pd.DataFrame,
-        image_width: int = cfg.data.image_size[0],
-        image_height: int = cfg.data.image_size[1],
+        image_size: Tuple[int, int] = cfg.data.image_size,   # (H, W)
         is_train: bool = True,
-        aug_level: int = cfg.data.aug_level,   
+        aug_level: int = cfg.data.aug_level,
+        num_classes: int = cfg.data.num_classes,
+        verbose_missing: bool = False,
     ):
         self.df = df
-        self.image_width = image_width
-        self.image_height = image_height
+        self.image_height, self.image_width = image_size
+        self.num_classes = num_classes
+        self.verbose_missing = verbose_missing
         self.transform = build_transforms(is_train, aug_level)
+        self._missing_view_count = 0
         self._build_patient_index()
 
     def _build_patient_index(self):
-        """Group rows theo patient_id, tạo index."""
         self.patients: List[str] = self.df["patient_id"].unique().tolist()
-
-        # Dict: patient_id → {view_key → row}
         self.patient_views: Dict[str, Dict[str, pd.Series]] = {}
-        self.patient_labels: Dict[str, list] = {}
+        self.patient_labels: Dict[str, torch.Tensor] = {}
 
         for pid, group in self.df.groupby("patient_id"):
             view_map = {}
-            label_vec = torch.zeros(cfg.data.num_classes, dtype=torch.float32)
-            for _, row in group.iterrows():
-                lat = str(row["laterality"]).strip().upper()    # L / R
-                view = str(row["view_position"]).strip().upper() # MLO / CC
-                key = f"{lat}_{view}"
-                view_map[key] = row
-                cls_indices  = ast.literal_eval(row["target"])
-                for cls_idx in cls_indices:
-                    label_vec[cls_idx] = 1.0
-            self.patient_views[pid] = view_map
+            label_vec = torch.zeros(self.num_classes, dtype=torch.float32)
 
+            for _, row in group.iterrows():
+                lat = str(row["laterality"]).strip().upper()      # L / R
+                view = str(row["view_position"]).strip().upper()  # MLO / CC
+                view_map[f"{lat}_{view}"] = row
+
+                target = row["target"]
+                if isinstance(target, str):
+                    target = ast.literal_eval(target)
+                if isinstance(target, (int, np.integer)):
+                    target = [int(target)]
+                for cls_idx in target:
+                    label_vec[int(cls_idx)] = 1.0
+
+            # Nếu có bất kỳ finding nào → không còn là "no finding"
             if label_vec[1:].sum() > 0:
                 label_vec[0] = 0.0
+
+            self.patient_views[pid] = view_map
             self.patient_labels[pid] = label_vec
 
     def __len__(self) -> int:
@@ -91,79 +91,80 @@ class MammoDataset(Dataset):
     def __getitem__(self, idx: int):
         pid = self.patients[idx]
         view_map = self.patient_views[pid]
-        label = self.patient_labels[pid]
 
         images = {}
         for key in VIEW_KEYS:
             if key in view_map:
-                img_path = view_map[key]["image_path"]
-                img = self._load_image(img_path)
+                images[key] = self._load_image(view_map[key]["image_path"])
             else:
-                # Thiếu view → tạo ảnh đen (padding)
-                # Dùng transform tạo tensor rỗng đúng size
-                print("Thiếu view")
-                img = self._empty_image()
-
-            images[key] = img
+                self._missing_view_count += 1
+                if self.verbose_missing:
+                    print(f"[Dataset] Thiếu view {key} ở bệnh nhân {pid} → dùng ảnh đen.")
+                images[key] = self._empty_image()
 
         return {
-            "images": images,                          # Dict[str, Tensor(3,H,W)]
-            "label": torch.tensor(label, dtype=torch.float32),
+            "images": images,
+            # label đã là Tensor → clone().detach(), KHÔNG dùng torch.tensor(tensor)
+            "label": self.patient_labels[pid].clone().detach(),
             "patient_id": pid,
         }
 
     def _load_image(self, path: str) -> torch.Tensor:
-        img = Image.open(path).convert("L")        # PIL Image, grayscale 1 kênh
+        img = Image.open(path).convert("L")
+        # Ảnh đã resize sẵn, nhưng vẫn ép đúng size để chắc chắn không lệch shape
+        if img.size != (self.image_width, self.image_height):   # PIL dùng (W, H)
+            img = img.resize((self.image_width, self.image_height), Image.BILINEAR)
         img_np = np.array(img, dtype=np.uint8)
         return self.transform(img_np)          # → Tensor(3, H, W)
 
     def _empty_image(self) -> torch.Tensor:
-        """Tạo ảnh đen khi thiếu view (shape chuẩn để không crash collate)."""
         blank = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
-        return self.transform(blank)          # → Tensor(3, H, W)
+        return self.transform(blank)
 
-    def get_labels(self) -> List[int]:
-        """Trả về list labels theo thứ tự patients (dùng cho WeightedSampler)."""
+    def get_labels(self) -> List[torch.Tensor]:
         return [self.patient_labels[pid] for pid in self.patients]
 
+    def class_counts(self) -> np.ndarray:
+        return torch.stack(self.get_labels()).sum(0).numpy()
+
 
 # ──────────────────────────────────────────────
-# Patient-level Split
-# ──────────────────────────────────────────────
-# ──────────────────────────────────────────────
-# Patient-level Split — dùng cột split gốc của VinDr-Mammo
+# Patient-level Split (dùng cột 'split' gốc của VinDr-Mammo)
 # ──────────────────────────────────────────────
 def split_patients(
     df: pd.DataFrame,
     val_ratio: float,
     seed: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    VinDr-Mammo đã có sẵn cột 'split' = 'training' | 'test'.
-    → Giữ nguyên test set gốc.
-    → Từ training, tách thêm val theo patient_id (không theo image).
-    """
     train_full_df = df[df["split"] == "training"].reset_index(drop=True)
-    test_df       = df[df["split"] == "test"].reset_index(drop=True)
+    test_df = df[df["split"] == "test"].reset_index(drop=True)
 
-    # Tách val từ training theo patient_id (patient-level, tránh leakage)
     train_patients = train_full_df["patient_id"].unique().tolist()
-    random.seed(seed)
-    random.shuffle(train_patients)
+    rng = random.Random(seed)          # RNG riêng — không đụng global seed
+    rng.shuffle(train_patients)
 
-    n_val = max(1,int(len(train_patients) * val_ratio))
-    val_pids   = set(train_patients[:n_val])
+    n_val = max(1, int(len(train_patients) * val_ratio))
+    val_pids = set(train_patients[:n_val])
     train_pids = set(train_patients[n_val:])
 
     train_df = train_full_df[train_full_df["patient_id"].isin(train_pids)].reset_index(drop=True)
-    val_df   = train_full_df[train_full_df["patient_id"].isin(val_pids)].reset_index(drop=True)
+    val_df = train_full_df[train_full_df["patient_id"].isin(val_pids)].reset_index(drop=True)
 
-    print(f"[Split] Dùng split gốc VinDr-Mammo:")
+    print("[Split] Dùng split gốc VinDr-Mammo:")
     print(f"  Train : {train_df['patient_id'].nunique()} patients")
-    print(f"  Val   : {val_df['patient_id'].nunique()}   patients  (tách từ training, ratio={val_ratio})")
-    print(f"  Test  : {test_df['patient_id'].nunique()}  patients  (gốc từ dataset)")
-    print(f"Tổng: {train_df['patient_id'].nunique() + val_df['patient_id'].nunique() + test_df['patient_id'].nunique()}")
+    print(f"  Val   : {val_df['patient_id'].nunique()} patients (tách từ training, ratio={val_ratio})")
+    print(f"  Test  : {test_df['patient_id'].nunique()} patients (gốc)")
     return train_df, val_df, test_df
+
+
+# ──────────────────────────────────────────────
+# Collate
+# ──────────────────────────────────────────────
+def mammo_collate_fn(batch):
+    images = {k: torch.stack([item["images"][k] for item in batch]) for k in VIEW_KEYS}
+    labels = torch.stack([item["label"] for item in batch])
+    patient_ids = [item["patient_id"] for item in batch]
+    return {"images": images, "label": labels, "patient_id": patient_ids}
 
 
 # ──────────────────────────────────────────────
@@ -171,72 +172,51 @@ def split_patients(
 # ──────────────────────────────────────────────
 def build_dataloaders(
     csv_path: str,
-    image_size: Tuple[int, int],
+    image_size: Tuple[int, int],     # (H, W)
     batch_size: int,
     num_workers: int,
-    val_ratio: float,        
-    seed: int ,
-    aug_level: int,      
+    val_ratio: float,
+    seed: int,
+    aug_level: int,
+    num_classes: int = cfg.data.num_classes,
+    persistent_workers: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
 
     df = pd.read_csv(csv_path)
 
-    # Validate required columns
-    required = {"patient_id", "laterality", "view_position", "image_path", "target"}
+    required = {"patient_id", "laterality", "view_position", "image_path", "target", "split"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV thiếu cột: {missing}")
 
-    train_df, val_df, test_df = split_patients(df, val_ratio = val_ratio, seed = seed)
-    print(f"[Dataset] MedAugment level={aug_level}, PA={0.2*aug_level:.1f}")
+    train_df, val_df, test_df = split_patients(df, val_ratio=val_ratio, seed=seed)
+    print(f"[Dataset] MedAugment level={aug_level}, PA={0.2 * aug_level:.1f}, image_size(H,W)={image_size}")
 
-    train_ds = MammoDataset(train_df, image_size[0], image_size[1], is_train=True,  aug_level=aug_level)
-    val_ds   = MammoDataset(val_df,   image_size[0], image_size[1], is_train=False, aug_level=aug_level)
-    test_ds  = MammoDataset(test_df,  image_size[0], image_size[1], is_train=False, aug_level=aug_level)
+    train_ds = MammoDataset(train_df, image_size, is_train=True, aug_level=aug_level, num_classes=num_classes)
+    val_ds = MammoDataset(val_df, image_size, is_train=False, aug_level=aug_level, num_classes=num_classes)
+    test_ds = MammoDataset(test_df, image_size, is_train=False, aug_level=aug_level, num_classes=num_classes)
 
+    common = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=mammo_collate_fn,
+        persistent_workers=persistent_workers and num_workers > 0,
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
-        num_workers=num_workers, pin_memory=True, drop_last=True,
-        collate_fn=mammo_collate_fn,
+        shuffle=True,            # ← BẮT BUỘC, đặc biệt với contrastive learning
+        drop_last=True,          # giữ batch đều cho BatchNorm trong ProjectionHead
+        **common,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        collate_fn=mammo_collate_fn,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        collate_fn=mammo_collate_fn,
-    )
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False, **common)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False, **common)
 
+    print(f"[Dataset] batches — train: {len(train_loader)}, val: {len(val_loader)}, test: {len(test_loader)}")
     return train_loader, val_loader, test_loader
 
 
-def mammo_collate_fn(batch):
-    """
-    Custom collate: stack images per view key.
-    Output images: Dict[str, Tensor(B, 3, H, W)]
-    """
-    keys = VIEW_KEYS
-    images = {k: torch.stack([item["images"][k] for item in batch]) for k in keys}
-    labels = torch.stack([item["label"] for item in batch])
-    patient_ids = [item["patient_id"] for item in batch]
-
-    return {"images": images, "label": labels, "patient_id": patient_ids}
-
-
-
-# trainloader trả về:
-# batch = next(iter(trainloader))
-
-# batch["images"] = {
-#     "L_MLO": {B, 3 ,H,W},
-#     "L_CC": {B, 3 ,H,W},
-#     "R_MLO": {B, 3 ,H,W},
-#     "R_CC": {B, 3 ,H,W},
-# }
-
-# batch["label"] = [B, (multi-hot-vector)] = [(0,0,0,1),(1,0,0,0), (0,1,1,0),...]
-# batch["patient_ids"] = [B, (ids)]
+# batch = next(iter(train_loader))
+#   batch["images"]["L_MLO"] → (B, 3, H, W)
+#   batch["label"]           → (B, 4) multi-hot
+#   batch["patient_id"]      → List[str] độ dài B
