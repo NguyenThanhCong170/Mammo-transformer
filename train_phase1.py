@@ -81,9 +81,14 @@ def train_one_epoch(
             list(backbone.parameters()) + list(proj_head.parameters()),
             max_norm=cfg.train.grad_clip,
         )
+        # GradScaler BỎ QUA optimizer.step() khi gradient inf/nan (hay xảy ra ở
+        # vài step đầu khi scale còn cao). Nếu vẫn gọi scheduler.step() thì LR
+        # schedule lệch pha so với số bước thật — và PyTorch cảnh báo.
+        scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()                          # ← per-STEP, khớp với total_steps
+        if scaler.get_scale() >= scale_before:    # step thật sự đã chạy
+            scheduler.step()                      # ← per-STEP, khớp total_steps
 
         loss_val = loss.item()
         total_loss += loss_val

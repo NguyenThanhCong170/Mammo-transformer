@@ -102,10 +102,13 @@ def train_one_epoch(
                 [p for p in model.parameters() if p.requires_grad],
                 max_norm=cfg.train.grad_clip,
             )
+            # Xem giải thích trong train_phase1.py: scaler có thể bỏ qua step.
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            scheduler.step()               # ← step theo OPTIMIZER STEP, không theo epoch
+            if scaler.get_scale() >= scale_before:
+                scheduler.step()           # ← theo OPTIMIZER STEP, không theo epoch
             global_step += 1
 
         batch_loss = loss.item() * accumulate_steps
