@@ -4,10 +4,9 @@ Inference — dự đoán cho 1 bệnh nhân mới (4 ảnh DICOM đã crop).
  
 import torch
 import numpy as np
-import pydicom
-from pydicom.pixel_data_handlers.util import apply_voi_lut
+
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional,Tuple
  
 from models.mammo_transformer import MammoTransformer
 from data.augmentation import ValTransform
@@ -44,50 +43,14 @@ def load_model(checkpoint_path: str, cfg: Config, device: torch.device) -> Mammo
  
     return model
  
- 
-# ──────────────────────────────────────────────
-# DICOM loader — giống dataset.py
-# ──────────────────────────────────────────────
-def _load_dicom_as_uint8(path: str) -> np.ndarray:
-    """
-    Đọc file DICOM → numpy uint8 (H, W).
-    Pipeline giống _load_image() trong dataset.py.
-    """
-    ds    = pydicom.dcmread(path)
-    pixel = ds.pixel_array.astype(np.float32)
- 
-    # Multi-frame hoặc channel dim
-    n_frames = int(getattr(ds, "NumberOfFrames", 1))
-    if n_frames > 1:
-        pixel = pixel[0]
-    elif pixel.ndim == 3:
-        pixel = pixel[:, :, 0]
- 
-    # VOI LUT windowing
-    pixel = apply_voi_lut(pixel, ds, prefer_lut=True).astype(np.float32)
- 
-    # MONOCHROME1 → invert
-    if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-        pixel = pixel.max() - pixel
- 
-    # Normalize → uint8
-    p_min, p_max = pixel.min(), pixel.max()
-    if p_max > p_min:
-        pixel = (pixel - p_min) / (p_max - p_min) * 255.0
-    return pixel.astype(np.uint8)
- 
- 
-# ──────────────────────────────────────────────
-# Predict
-# ──────────────────────────────────────────────
 @torch.no_grad()
 def predict_patient(
     model:       MammoTransformer,
     image_paths: Dict[str, str],   # {"L_MLO": path.dicom, "L_CC": path.dicom, ...}
-    image_size:  int   = 256,
-    threshold:   float = 0.5,
+    image_size: Tuple[int,int] = (1856, 704),
+    threshold:   float = 0.7,
     device:      Optional[torch.device] = None,
-) -> Dict:
+):
     """
     Dự đoán cho 1 bệnh nhân.
  
@@ -107,34 +70,20 @@ def predict_patient(
     if device is None:
         device = next(model.parameters()).device
  
-    transform = ValTransform(image_size=image_size)  # resize + normalize, không augment
+    transform = ValTransform()
     images = {}
  
     for key in VIEW_KEYS:
         path = image_paths.get(key, "")
-        if path and Path(path).exists():
-            pixel = _load_dicom_as_uint8(path)      # (H, W) uint8
-        else:
-            print(f"  ⚠️  Missing view {key}, using blank image")
-            pixel = np.zeros((image_size, image_size), dtype=np.uint8)
- 
-        tensor = transform(pixel)                   # → (3, H, W) float normalized
-        images[key] = tensor.unsqueeze(0).to(device)  # → (1, 3, H, W)
- 
-    with torch.cuda.amp.autocast():
-        logit = model(images).item()
- 
-    prob = torch.sigmoid(torch.tensor(logit)).item()
-    pred = "Yes (BI-RADS 4/5)" if prob >= threshold else "No (BI-RADS 1-3)"
- 
-    return {
-        "probability":    round(prob, 4),
-        "prediction":     pred,
-        "label":          int(prob >= threshold),
-        "logit":          round(logit, 4),
-        "threshold_used": threshold,
-    }
- 
+        if not path:
+            raise ValueError(f"Thiếu ảnh cho view '{key}' — inference cần đủ 4 view.")
+        tensor = transform(path)                      # → (3, H, W) float normalized
+        images[key] = tensor.unsqueeze(0).to(device)   # → (1, 3, H, W)
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    with torch.amp.autocast(device_type=device_type):
+        logit = model(images)
+        probs = torch.sigmoid(logit).squeeze(0).cpu().numpy()
+    return probs
  
 # ──────────────────────────────────────────────
 # Example usage
@@ -158,7 +107,7 @@ if __name__ == "__main__":
             "R_CC":  "images_cropped/ff797ae566e0c252a105853faab6e7cd/d9caaef549cd1ea35fed601ed7dc2304.dicom",
         },
         image_size=cfg.model.backbone_img_size,
-        threshold=0.45,
+        threshold=0.7,
     )
  
     print("\n── Kết quả dự đoán ──")

@@ -19,6 +19,10 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 
+
+from configs.config import Config
+cfg = Config()
+
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
@@ -147,18 +151,11 @@ class MedAugmentTransform:
       4. M = [op_pixel] + [op_spatial(s)]
       5. M = shuffle(M)
       6. Apply M lần lượt lên ảnh
-
-    Args:
-        level : int ∈ {1,2,3,4,5} — cường độ augmentation
-                  1 = nhẹ nhất, 5 = mạnh nhất
-                  Khuyến nghị: 2 hoặc 3 cho mammography
-        image_size : int — resize trước khi augment
     """
 
-    def __init__(self, level: int = 3, image_size: int = 256):
+    def __init__(self, level):
         assert 1 <= level <= 5, "level phải trong khoảng [1, 5]"
         self.level      = level
-        self.image_size = image_size
         self.pixel_pool   = _build_pixel_pool(level)
         self.spatial_pool = _build_spatial_pool(level)
 
@@ -182,28 +179,9 @@ class MedAugmentTransform:
         return A.Compose(ops)
 
     def __call__(self, img_np: np.ndarray) -> torch.Tensor:
-        """
-        Nhận numpy array đã được load từ DICOM (uint8, shape HW hoặc HWC).
-        → Tensor (3, H, W) normalized
-
-        Pipeline:
-          numpy(H,W) uint8
-            → resize
-            → MedAugment branch
-            → replicate sang 3 channel (grayscale → RGB)
-            → normalize (ImageNet stats)
-            → Tensor(3, H, W)
-        """
         # Đảm bảo HW (grayscale 2D)
         if img_np.ndim == 3:
             img_np = img_np[:, :, 0]
-
-        # Resize
-        img_np = cv2.resize(
-            img_np,
-            (self.image_size, self.image_size),
-            interpolation=cv2.INTER_LINEAR,
-        )  # shape: (H, W), dtype: uint8
 
         # Albumentations yêu cầu HWC
         img_hwc = img_np[:, :, np.newaxis]   # (H, W, 1)
@@ -234,23 +212,10 @@ class MedAugmentTransform:
 # Validation / Inference Transform (không augment)
 # ─────────────────────────────────────────────────────────────
 class ValTransform:
-    def __init__(self, image_size: int = 256):
-        self.image_size = image_size
-
     def __call__(self, img_np: np.ndarray) -> torch.Tensor:
-        """
-        img_np: numpy array uint8 (H, W) từ DICOM
-        → Tensor (3, H, W) normalized
-        """
+
         if img_np.ndim == 3:
             img_np = img_np[:, :, 0]
-
-        img_np = cv2.resize(
-            img_np,
-            (self.image_size, self.image_size),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
         # Grayscale → 3 channel
         img_3c = np.stack([img_np, img_np, img_np], axis=0)  # (3, H, W)
         tensor = torch.from_numpy(img_3c).float() / 255.0
@@ -263,7 +228,7 @@ class ValTransform:
 # ─────────────────────────────────────────────────────────────
 # Factory (drop-in replacement cho build_transforms cũ)
 # ─────────────────────────────────────────────────────────────
-def build_transforms(image_size: int, is_train: bool, aug_level: int = 3):
+def build_transforms(is_train: bool, aug_level: int):
     """
     Factory function — tương thích với dataset.py hiện tại.
 
@@ -276,6 +241,6 @@ def build_transforms(image_size: int, is_train: bool, aug_level: int = 3):
                      - level=4 : mạnh hơn, cần monitor overfitting
     """
     if is_train:
-        return MedAugmentTransform(level=aug_level, image_size=image_size)
+        return MedAugmentTransform(level=aug_level)
     else:
-        return ValTransform(image_size=image_size)
+        return ValTransform()

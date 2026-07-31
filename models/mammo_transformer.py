@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from configs.config import Config
+cfg = Config()
 
 # ──────────────────────────────────────────────
 # 1. Swin-V2 Backbone Wrapper
@@ -29,18 +31,20 @@ class SwinV2Backbone(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "swinv2_base_window12to16_192to256",
-        pretrained: bool = True,
-        img_size: int = 256,
+        model_name: str,
+        pretrained: bool,
+        img_width: int,
+        img_height: int
     ):
         super().__init__()
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
-            img_size=img_size,
+            img_size=(img_height, img_width),
             num_classes=0,        # Xóa head classifier
             global_pool="avg",    # Global average pool → (B, C)
         )
+        self.backbone.set_grad_checkpointing(True)
         self.out_dim = self.backbone.num_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -231,7 +235,7 @@ class BilateralFusion(nn.Module):
 # 6. MLP Classifier
 # ──────────────────────────────────────────────
 class MLPClassifier(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, dropout: float):
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float, num_class: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -241,11 +245,11 @@ class MLPClassifier(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),  # Binary output
+            nn.Linear(hidden_dim // 2,num_class),  
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)  # (B,)
+        return self.net(x)  # (B,)
 
 
 # ──────────────────────────────────────────────
@@ -265,17 +269,17 @@ class MammoTransformer(nn.Module):
 
     def __init__(
         self,
-        backbone_name:       str   = "swinv2_base_window12to16_192to256",
-        backbone_pretrained: bool  = True,
-        backbone_img_size:   int   = 256,
-        embed_dim:           int   = 1024,
-        num_heads:           int   = 8,
-        attn_dropout:        float = 0.1,
-        ffn_dropout:         float = 0.1,
-        num_ipsi_layers:     int   = 2,
-        num_bilateral_layers:int   = 2,
-        mlp_hidden_dim:      int   = 512,
-        mlp_dropout:         float = 0.3,
+        backbone_name:       str,
+        backbone_pretrained: bool,
+        backbone_img_size:   Tuple[int,int],
+        embed_dim:           int,
+        num_heads:           int,
+        attn_dropout:        float,
+        ffn_dropout:         float,
+        num_ipsi_layers:     int,
+        num_bilateral_layers:int,
+        mlp_hidden_dim:      int,
+        mlp_dropout:         float,
     ):
         super().__init__()
 
@@ -345,8 +349,7 @@ class MammoTransformer(nn.Module):
         logits = self.classifier(global_feat)  # (B,)
 
         return logits
-
-    # ── Helpers cho 2-phase training
+    
     def freeze_backbone(self):
         self.backbone.freeze()
         print("[Model] Backbone frozen.")
@@ -355,7 +358,7 @@ class MammoTransformer(nn.Module):
         self.backbone.unfreeze()
         print("[Model] Backbone unfrozen.")
 
-    def get_param_groups(self, lr: float, backbone_lr_multiplier: float = 0.1):
+    def get_param_groups(self, lr: float, backbone_lr_multiplier):
         """
         Trả về param groups để backbone có LR nhỏ hơn.
         """
@@ -363,7 +366,7 @@ class MammoTransformer(nn.Module):
         other_params = [p for n, p in self.named_parameters()
                         if not any(p is bp for bp in backbone_params)]
         return [
-            {"params": backbone_params, "lr": lr * backbone_lr_multiplier},
+            {"params": backbone_params, "lr": 0},
             {"params": other_params,    "lr": lr},
         ]
 

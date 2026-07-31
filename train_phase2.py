@@ -1,7 +1,7 @@
 """
 Training loop — 2-phase strategy:
-  Phase 1: Freeze backbone, train attention + classifier
-  Phase 2: Unfreeze backbone, full fine-tune với LR nhỏ hơn
+  Phase 1: Unfreeze backbone, train contrastive loss
+  Phase 2: freeze backbone, train attention + MLP
 """
 
 import os
@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -26,20 +26,19 @@ from utils.losses import FocalLoss, MetricsCalculator
 # Checkpoint Manager
 # ──────────────────────────────────────────────
 class CheckpointManager:
-    def __init__(self, output_dir: str, save_top_k: int = 3, monitor: str = "auc"):
+    def __init__(self, output_dir: str, save_top_k: int = 100, monitor: str = "auc"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.save_top_k = save_top_k
         self.monitor = monitor
         self.top_checkpoints = []  # List of (score, path)
 
-    def save(self, model, optimizer, epoch: int, metrics: dict, phase: str):
+    def save(self, model, optimizer, epoch: int, metrics: dict):
         score = metrics.get(self.monitor, 0.0)
-        path = self.output_dir / f"epoch{epoch:03d}_{phase}_{self.monitor}{score:.4f}.pt"
+        path = self.output_dir / f"epoch{epoch:03d}_{self.monitor}{score:.4f}.pt"
 
         torch.save({
             "epoch": epoch,
-            "phase": phase,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "metrics": metrics,
@@ -138,20 +137,11 @@ def validate(model, loader, criterion, device) -> dict:
 # ──────────────────────────────────────────────
 # Build Optimizer + Scheduler
 # ──────────────────────────────────────────────
-def build_optimizer_scheduler(model, lr: float, cfg: Config, total_steps: int, phase: int):
-    if phase == 1:
-        # Phase 1: Chỉ optimize non-backbone parameters
-        params = [p for n, p in model.named_parameters()
-                  if "backbone" not in n and p.requires_grad]
-        optimizer = AdamW(params, lr=lr, weight_decay=cfg.train.weight_decay)
-    else:
-        # Phase 2: Full model với backbone LR nhỏ hơn
-        param_groups = model.get_param_groups(
-            lr=lr,
-            backbone_lr_multiplier=cfg.train.backbone_lr_multiplier
-        )
-        optimizer = AdamW(param_groups, weight_decay=cfg.train.weight_decay)
-
+def build_optimizer_scheduler(model, lr: float, cfg: Config, total_steps: int):
+    # Chỉ optimize non-backbone parameters
+    params = [p for n, p in model.named_parameters()
+                if "backbone" not in n and p.requires_grad]
+    optimizer = AdamW(params, lr=lr, weight_decay=cfg.train.weight_decay)
     # Warmup không được vượt quá total_steps
     effective_warmup = min(cfg.train.warmup_steps, max(1, total_steps // 2))
 
@@ -230,25 +220,25 @@ def train(cfg: Config):
     )
 
     # ── History
-    history = {"phase1": [], "phase2": []}
+    history = {"phase2": []}
     best_auc = 0.0
     no_improve = 0
 
     # ════════════════════════════════
-    # PHASE 1: Freeze backbone
+    # Freeze backbone
     # ════════════════════════════════
     print("\n" + "="*60)
-    print("  PHASE 1 — Frozen backbone, training attention + classifier")
+    print("Frozen backbone, training attention + classifier")
     print("="*60)
 
     model.freeze_backbone()
 
-    steps_p1 = len(train_loader) * cfg.train.epochs_phase1
-    optimizer1, scheduler1 = build_optimizer_scheduler(model, cfg.train.lr_phase1, cfg, steps_p1, phase=1)
+    steps_p1 = len(train_loader) * cfg.train.epochs_phase2
+    optimizer1, scheduler1 = build_optimizer_scheduler(model, cfg.train.lr_phase2, cfg, steps_p1)
 
-    for epoch in range(1, cfg.train.epochs_phase1 + 1):
+    for epoch in range(1, cfg.train.epochs_phase2 + 1):
         t0 = time.time()
-        print(f"\n── Epoch {epoch}/{cfg.train.epochs_phase1} [Phase 1]")
+        print(f"\n── Epoch {epoch}/{cfg.train.epochs_phase2} [Phase 2]")
 
         train_metrics = train_one_epoch(
             model, train_loader, optimizer1, criterion, scaler,
@@ -259,7 +249,7 @@ def train(cfg: Config):
 
         epoch_log = {"epoch": epoch, "train": train_metrics, "val": val_metrics,
                      "time": round(time.time() - t0, 1)}
-        history["phase1"].append(epoch_log)
+        history["phase2"].append(epoch_log)
 
         if val_metrics["auc"] > best_auc:
             best_auc = val_metrics["auc"]
@@ -268,49 +258,9 @@ def train(cfg: Config):
         else:
             no_improve += 1
 
-        print(f"  [Phase 1] Epoch {epoch} | Val AUC: {val_metrics['auc']:.4f} | "
-              f"Best: {best_auc:.4f} | Time: {epoch_log['time']}s")
-
-    # ════════════════════════════════
-    # PHASE 2: Unfreeze backbone
-    # ════════════════════════════════
-    print("\n" + "="*60)
-    print("  PHASE 2 — Full fine-tune (backbone LR × 0.1)")
-    print("="*60)
-
-    model.unfreeze_backbone()
-    no_improve = 0
-
-    steps_p2 = len(train_loader) * cfg.train.epochs_phase2
-    optimizer2, scheduler2 = build_optimizer_scheduler(model, cfg.train.lr_phase2, cfg, steps_p2, phase=2)
-
-    for epoch in range(1, cfg.train.epochs_phase2 + 1):
-        t0 = time.time()
-        print(f"\n── Epoch {epoch}/{cfg.train.epochs_phase2} [Phase 2]")
-
-        train_metrics = train_one_epoch(
-            model, train_loader, optimizer2, criterion, scaler,
-            device, cfg.train.accumulate_grad_steps, epoch
-        )
-        val_metrics = validate(model, val_loader, criterion, device)
-        scheduler2.step()
-
-        epoch_log = {"epoch": epoch, "train": train_metrics, "val": val_metrics,
-                     "time": round(time.time() - t0, 1)}
-        history["phase2"].append(epoch_log)
-
-        if val_metrics["auc"] > best_auc:
-            best_auc = val_metrics["auc"]
-            ckpt_manager.save(model, optimizer2, epoch, val_metrics, "p2")
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= cfg.train.early_stopping_patience:
-                print(f"\n[Early Stopping] No improvement for {no_improve} epochs.")
-                break
-
         print(f"  [Phase 2] Epoch {epoch} | Val AUC: {val_metrics['auc']:.4f} | "
               f"Best: {best_auc:.4f} | Time: {epoch_log['time']}s")
+
 
     # ════════════════════════════════
     # FINAL TEST EVALUATION

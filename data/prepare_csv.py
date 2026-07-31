@@ -1,25 +1,17 @@
-"""
-Script chuẩn bị CSV từ VinDr-Mammo raw annotations.
-
-VinDr-Mammo structure (sau khi download):
-  physionet.org/files/vindr-mammo/1.0.0/
-  ├── finding_annotations.csv
-  ├── breast_level_annotations.csv
-  └── images/
-      └── {study_id}/
-          └── {image_id}.dicom  
-"""
-
 import pandas as pd
 import os
 from pathlib import Path
+
+from configs.config import Config
+cfg = Config()
 
 
 def prepare_vindr_csv(
     breast_annotations_path: str,   # breast_level_annotations.csv
     images_dir: str,                 # Thư mục chứa ảnh đã crop (.png)
     output_csv_path: str,
-    image_ext: str = ".dicom",
+    image_ext: str,
+    label_mapping
 ):
     """
     breast_level_annotations.csv columns:
@@ -37,7 +29,6 @@ def prepare_vindr_csv(
     df["view_position"]  = df["view_position"].str.strip().str.upper() # MLO / CC
 
     # Tạo đường dẫn ảnh
-    # Giả sử bạn đã lưu ảnh theo: {images_dir}/{patient_id}/{image_id}.png
     def build_path(row):
         path = Path(images_dir) / row["patient_id"] / f"{row['image_id']}{image_ext}"
         return str(path.as_posix())
@@ -63,27 +54,39 @@ def prepare_vindr_csv(
     df_complete = df[df["patient_id"].isin(complete)].copy()
 
     # Parse BI-RADS
-    df_complete["birads_int"] = df_complete["breast_birads"].apply(
-        lambda x: int(str(x).replace("BI-RADS", "").strip())
-    )
+    df_complete["target"] = df_complete["finding_categories"]
+
 
     # Label
-    df_complete["label"] = df_complete["birads_int"].apply(
-        lambda x: 1 if x in [4, 5] else 0
-    )
+    def text_to_label_id(category_text):
+        """
+        Hàm chuyển đổi category string thành integer label.
+        """
+        labels = []
+        if "Asymmetry" in category_text or "Global Asymmetry" in category_text or "Focal Asymmetry" in category_text:
+            labels.append(label_mapping["Asymmetry"])
+        
+        if "Mass" in category_text:
+            labels.append(label_mapping["Mass"])
+            
+        if "Suspicious Calcification" in category_text:
+            labels.append(label_mapping["Suspicious Calcification"])
+            
+        if len(labels) == 0:
+            labels.append(label_mapping["no finding"])
+        return labels
+    
+    df_complete["target"] = df_complete["finding_categories"].apply(text_to_label_id)
+        
 
     # Class distribution
-    patient_labels = df_complete.groupby("patient_id")["label"].max()
-    pos = patient_labels.sum()
-    neg = len(patient_labels) - pos
-    print(f"\nClass distribution (patient-level):")
-    print(f"  Positive (BI-RADS 4,5): {pos} ({pos/len(patient_labels)*100:.1f}%)")
-    print(f"  Negative (BI-RADS 1-3): {neg} ({neg/len(patient_labels)*100:.1f}%)")
+    print("Thống kê số lượng mỗi class:")
+    print(df_complete["target"].value_counts())
 
     # Save
     output_cols = [
-        "patient_id", "image_id", "laterality", "view_position",
-        "image_path", "breast_birads", "birads_int", "label", "split"  # ← giữ cột split gốc
+        "patient_id", "image_id",
+        "image_path", 'laterality', "view_position", "target", "split"  # ← giữ cột split gốc
     ]
     df_complete[output_cols].to_csv(output_csv_path, index=False)
     print(f"\n✅ Saved: {output_csv_path} ({len(df_complete)} rows)")
@@ -93,8 +96,9 @@ def prepare_vindr_csv(
 
 if __name__ == "__main__":
     prepare_vindr_csv(
-        breast_annotations_path="finding_annotations.csv",
-        images_dir="images_cropped",
-        output_csv_path="labels.csv",
-        image_ext=".dicom",
+        breast_annotations_path= cfg.data.csv_path,
+        images_dir= cfg.data.data_root,
+        output_csv_path= "labels.csv",
+        image_ext= cfg.data.image_ext,
+        label_mapping = cfg.data.label_mapping
     )

@@ -10,9 +10,11 @@ Cấu trúc CSV mong đợi:
 """
 
 import os
+import ast
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from PIL import Image
 
 import numpy as np
 import pandas as pd
@@ -22,7 +24,8 @@ from pydicom.pixel_data_handlers.util import apply_voi_lut
 from torch.utils.data import DataLoader, Dataset
 
 from data.augmentation import build_transforms
-
+from configs.config import Config
+cfg = Config()
 
 # ──────────────────────────────────────────────
 # View keys chuẩn hóa
@@ -30,12 +33,6 @@ from data.augmentation import build_transforms
 VIEW_KEYS = ["L_MLO", "L_CC", "R_MLO", "R_CC"]
 
 VIEW_INDEX = {key: i for i, key in enumerate(VIEW_KEYS)}  # {"L_MLO": 0, ...}
-
-
-def _parse_birads(raw: str) -> int:
-    """'BI-RADS 4' → 4, '4' → 4"""
-    return int(str(raw).replace("BI-RADS", "").strip())
-
 
 # ──────────────────────────────────────────────
 # Main Dataset
@@ -52,15 +49,15 @@ class MammoDataset(Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
-        image_size: int = 512,
-        positive_birads: Tuple[int, ...] = (4, 5),
+        image_width: int = cfg.data.image_size[0],
+        image_height: int = cfg.data.image_size[1],
         is_train: bool = True,
-        aug_level: int = 3,          # MedAugment level ∈ {1..5}
+        aug_level: int = cfg.data.aug_level,   
     ):
         self.df = df
-        self.positive_birads = positive_birads
-        self.image_size = image_size
-        self.transform = build_transforms(image_size, is_train, aug_level)
+        self.image_width = image_width
+        self.image_height = image_height
+        self.transform = build_transforms(is_train, aug_level)
         self._build_patient_index()
 
     def _build_patient_index(self):
@@ -69,22 +66,24 @@ class MammoDataset(Dataset):
 
         # Dict: patient_id → {view_key → row}
         self.patient_views: Dict[str, Dict[str, pd.Series]] = {}
-        self.patient_labels: Dict[str, int] = {}
+        self.patient_labels: Dict[str, list] = {}
 
         for pid, group in self.df.groupby("patient_id"):
             view_map = {}
+            label_vec = torch.zeros(cfg.data.num_classes, dtype=torch.float32)
             for _, row in group.iterrows():
                 lat = str(row["laterality"]).strip().upper()    # L / R
                 view = str(row["view_position"]).strip().upper() # MLO / CC
                 key = f"{lat}_{view}"
                 view_map[key] = row
-
+                cls_indices  = ast.literal_eval(row["target"])
+                for cls_idx in cls_indices:
+                    label_vec[cls_idx] = 1.0
             self.patient_views[pid] = view_map
 
-            # Label: patient positive nếu BẤT KỲ bên nào BI-RADS 4/5
-            birads_vals = [_parse_birads(row["breast_birads"]) for row in view_map.values()]
-            label = int(any(b in self.positive_birads for b in birads_vals))
-            self.patient_labels[pid] = label
+            if label_vec[1:].sum() > 0:
+                label_vec[0] = 0.0
+            self.patient_labels[pid] = label_vec
 
     def __len__(self) -> int:
         return len(self.patients)
@@ -102,6 +101,7 @@ class MammoDataset(Dataset):
             else:
                 # Thiếu view → tạo ảnh đen (padding)
                 # Dùng transform tạo tensor rỗng đúng size
+                print("Thiếu view")
                 img = self._empty_image()
 
             images[key] = img
@@ -113,40 +113,12 @@ class MammoDataset(Dataset):
         }
 
     def _load_image(self, path: str) -> torch.Tensor:
-        """
-        Đọc file DICOM → numpy uint8 → transform → Tensor(3,H,W).
-
-        Pipeline xử lý DICOM mammography:
-          1. pydicom đọc pixel_array  → thường là uint16 (12-bit hoặc 16-bit)
-          2. apply_voi_lut            → áp dụng windowing từ DICOM header
-          3. MONOCHROME1 correction   → invert nếu cần (trắng = không có gì)
-          4. Normalize về [0, 255]    → uint8 cho albumentations
-          5. transform (MedAugment hoặc Val) → Tensor(3,H,W)
-        """
-        ds         = pydicom.dcmread(path)
-        pixel      = ds.pixel_array.astype(np.float32)  # (H, W), uint16 range
-
-        # Áp dụng VOI LUT (Window Center / Window Width từ DICOM header)
-        # → chuẩn hóa về khoảng hiển thị đúng trên màn hình đọc phim
-        pixel = apply_voi_lut(pixel, ds, prefer_lut=True).astype(np.float32)
-
-        # MONOCHROME1: pixel cao = tối (ngược với convention thông thường)
-        # MONOCHROME2: pixel cao = sáng (convention chuẩn)
-        if hasattr(ds, "PhotometricInterpretation"):
-            if ds.PhotometricInterpretation == "MONOCHROME1":
-                pixel = pixel.max() - pixel   # invert
-
-        # Normalize về [0, 255] uint8
-        p_min, p_max = pixel.min(), pixel.max()
-        if p_max > p_min:
-            pixel = (pixel - p_min) / (p_max - p_min) * 255.0
-        pixel = pixel.astype(np.uint8)        # (H, W), uint8
-
+        pixel = Image.open(path)
         return self.transform(pixel)          # → Tensor(3, H, W)
 
     def _empty_image(self) -> torch.Tensor:
         """Tạo ảnh đen khi thiếu view (shape chuẩn để không crash collate)."""
-        blank = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
+        blank = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
         return self.transform(blank)          # → Tensor(3, H, W)
 
     def get_labels(self) -> List[int]:
@@ -162,22 +134,14 @@ class MammoDataset(Dataset):
 # ──────────────────────────────────────────────
 def split_patients(
     df: pd.DataFrame,
-    val_ratio: float = 0.15,
-    seed: int = 42,
-    # Các tham số dưới giữ để tương thích ngược, không dùng nữa
-    train_ratio: float = 0.70,
+    val_ratio: float,
+    seed: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     VinDr-Mammo đã có sẵn cột 'split' = 'training' | 'test'.
     → Giữ nguyên test set gốc.
     → Từ training, tách thêm val theo patient_id (không theo image).
     """
-    if "split" not in df.columns:
-        raise ValueError(
-            "CSV không có cột 'split'. "
-            "VinDr-Mammo chuẩn phải có cột này với giá trị 'training'/'test'."
-        )
-
     train_full_df = df[df["split"] == "training"].reset_index(drop=True)
     test_df       = df[df["split"] == "test"].reset_index(drop=True)
 
@@ -206,37 +170,51 @@ def split_patients(
 # ──────────────────────────────────────────────
 def build_dataloaders(
     csv_path: str,
-    image_size: int = 512,
-    batch_size: int = 4,
-    num_workers: int = 4,
-    val_ratio: float = 0.15,         # Tỉ lệ val tách từ training set gốc
-    seed: int = 42,
-    positive_birads: Tuple[int, ...] = (4, 5),
-    aug_level: int = 3,
-    train_ratio: float = 0.70,       # Giữ để tương thích ngược, không dùng
+    image_size: Tuple[int, int],
+    batch_size: int,
+    num_workers: int,
+    val_ratio: float,        
+    seed: int ,
+    aug_level: int,      
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
 
     df = pd.read_csv(csv_path)
 
     # Validate required columns
-    required = {"patient_id", "laterality", "view_position", "image_path", "breast_birads"}
+    required = {"patient_id", "laterality", "view_position", "image_path", "target"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV thiếu cột: {missing}")
 
-    train_df, val_df, test_df = split_patients(df, val_ratio = val_ratio, seed = seed, train_ratio = train_ratio)
+    train_df, val_df, test_df = split_patients(df, val_ratio = val_ratio, seed = seed)
     print(f"[Dataset] MedAugment level={aug_level}, PA={0.2*aug_level:.1f}")
 
-    train_ds = MammoDataset(train_df, image_size, positive_birads, is_train=True,  aug_level=aug_level)
-    val_ds   = MammoDataset(val_df,   image_size, positive_birads, is_train=False, aug_level=aug_level)
-    test_ds  = MammoDataset(test_df,  image_size, positive_birads, is_train=False, aug_level=aug_level)
+    train_ds = MammoDataset(train_df, image_size[0], image_size[1], is_train=True,  aug_level=aug_level)
+    val_ds   = MammoDataset(val_df,   image_size[0], image_size[1], is_train=False, aug_level=aug_level)
+    test_ds  = MammoDataset(test_df,  image_size[0], image_size[1], is_train=False, aug_level=aug_level)
 
     # Weighted sampler để handle class imbalance
     train_labels = train_ds.get_labels()
-    n_pos = sum(train_labels)
-    n_neg = len(train_labels) - n_pos
-    weights = [1.0 / n_neg if l == 0 else 1.0 / n_pos for l in train_labels]
-    sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights))
+    labels_np = train_labels.numpy()
+    # 1. Đếm số patient mang mỗi class (đếm theo CỘT, không flatten kiểu cũ)
+    class_counts = labels_np.sum(axis=0)           # shape [num_classes]
+
+    # 2. Tính trọng số cho từng class
+    class_weights = 1.0 / np.where(class_counts == 0, 1, class_counts)
+
+    # 3. Tính trọng số cho TỪNG bức ảnh (sample)
+    sample_weights = []
+    for label_vec in labels_np:
+        active = np.where(label_vec > 0)[0]        # các class index đang bật (=1)
+        if len(active) == 0:
+            w = class_weights[0]                    # fallback: coi như background
+        else:
+            w = max(class_weights[c] for c in active)
+        sample_weights.append(w)
+
+    # 4. Khởi tạo sampler
+    weights_tensor = torch.DoubleTensor(sample_weights)
+    sampler = torch.utils.data.WeightedRandomSampler(weights_tensor, len(weights_tensor))
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, sampler=sampler,
@@ -268,3 +246,18 @@ def mammo_collate_fn(batch):
     patient_ids = [item["patient_id"] for item in batch]
 
     return {"images": images, "label": labels, "patient_id": patient_ids}
+
+
+
+# trainloader trả về:
+# batch = next(iter(trainloader))
+
+# batch["images"] = {
+#     "L_MLO": {B, 3 ,H,W},
+#     "L_CC": {B, 3 ,H,W},
+#     "R_MLO": {B, 3 ,H,W},
+#     "R_CC": {B, 3 ,H,W},
+# }
+
+# batch["label"] = [B, (multi-hot-vector)] = [(0,0,0,1),(1,0,0,0), (0,1,1,0),...]
+# batch["patient_ids"] = [B, (ids)]
