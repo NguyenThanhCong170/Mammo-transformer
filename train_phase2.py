@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# PHẢI đặt TRƯỚC khi import torch (xem giải thích trong train_phase1.py).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW

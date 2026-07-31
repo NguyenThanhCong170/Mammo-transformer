@@ -11,6 +11,11 @@ Mô phỏng đúng 1 bước train thật: forward + backward + optimizer.step()
 
 import argparse
 import gc
+import os
+
+# Phải đặt trước import torch — nếu không, số đo sẽ là của allocator mặc định
+# và không khớp với lúc train (train_phase1/2.py đều bật expandable_segments).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -98,6 +103,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", type=int, default=1, choices=[1, 2])
     ap.add_argument("--max", type=int, default=128, help="trần trên khi dò")
+    ap.add_argument("--budget", type=float, default=None,
+                    help="GB tối đa được phép dùng (GPU dùng chung). "
+                         "Batch nào vượt ngưỡng reserved này bị coi là fail.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -127,6 +135,12 @@ def main():
             runner(cfg, bs, device, amp_dtype)
             peak = torch.cuda.max_memory_allocated() / 1024**3
             reserved = torch.cuda.max_memory_reserved() / 1024**3
+            # Trên GPU dùng chung, "chạy được" chưa đủ — phải nằm trong ngân sách.
+            # reserved mới là phần GPU thực sự bị chiếm, không phải peak allocated.
+            if args.budget is not None and reserved > args.budget:
+                print(f"  batch_size={bs:>3} ({bs*4:>3} ảnh) → reserved {reserved:5.2f} GB "
+                      f"> ngân sách {args.budget:.1f} GB  ✘")
+                return False
             peaks[bs] = (peak, reserved)
             print(f"  batch_size={bs:>3} ({bs*4:>3} ảnh) → peak {peak:5.2f} GB | "
                   f"reserved {reserved:5.2f} GB  ✔")
@@ -187,9 +201,10 @@ def main():
             print(f"  → {safe} bệnh nhân = {safe*4} ảnh/step, "
                   f"{(safe-1)*4} negative cho mỗi anchor")
     print("=" * 60)
-    print("\nMẹo giảm fragmentation (đặt TRƯỚC khi chạy train):")
-    print("  Windows PowerShell : $env:PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'")
-    print("  Linux/macOS        : export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+    print(f"\nexpandable_segments: BẬT (đặt sẵn trong script, cả train_phase1/2.py)")
+    print("Trên GPU dùng chung, dò lại theo ngân sách thật:")
+    print("  nvidia-smi --query-gpu=memory.used,memory.total --format=csv")
+    print(f"  python find_batch_size.py --phase {args.phase} --budget 22")
 
 
 if __name__ == "__main__":

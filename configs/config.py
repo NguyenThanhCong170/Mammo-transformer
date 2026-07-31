@@ -94,7 +94,9 @@ class TrainConfig:
     # ── Phase 1: contrastive pretrain backbone
     epochs_phase1: int = 50
     pretrained_phase1: bool = True          # khởi tạo từ ImageNet
-    batch_size_phase1: int = 2              # 2 bệnh nhân = 8 ảnh/forward
+    # Contrastive: batch CÀNG LỚN CÀNG TỐT (negative = 4*(B-1) mỗi anchor).
+    # Đo trên A40 dùng chung ~22 GB. Chạy lại find_batch_size.py nếu GPU trống hơn.
+    batch_size_phase1: int = 8              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
     lr_phase1: float = 1e-4
     temperature: float = 0.1
     proj_hidden_dim: int = 2048
@@ -104,8 +106,13 @@ class TrainConfig:
 
     # ── Phase 2: freeze backbone, train attention + MLP
     epochs_phase2: int = 50
-    batch_size: int = 4
-    accumulate_grad_steps: int = 4          # effective batch = 16
+    # Supervised: batch lớn KHÔNG tốt hơn — nó làm GIẢM số bước cập nhật gradient.
+    # Với ~3400 bệnh nhân train: eff.batch 16 → 212 step/epoch (10.600 step tổng).
+    # Nếu để eff.batch 256 thì chỉ còn 13 step/epoch (650 step) — quá ít để hội tụ.
+    # VRAM cho phép tới batch 64, nhưng ta chỉ dùng phần dư để BỎ accumulation
+    # (nhanh hơn), chứ không tăng effective batch.
+    batch_size: int = 16
+    accumulate_grad_steps: int = 1          # effective batch = 16
     lr_phase2: float = 3e-4
     # True = nạp backbone từ phase 1. Đặt False để train phase 2 từ ImageNet.
     load_phase1_backbone: bool = True

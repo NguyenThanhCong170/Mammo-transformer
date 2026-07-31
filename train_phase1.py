@@ -10,8 +10,14 @@ Chạy:
 """
 
 import json
+import os
 import time
 from pathlib import Path
+
+# PHẢI đặt TRƯỚC khi import torch — biến này chỉ có tác dụng lúc CUDA khởi tạo.
+# expandable_segments giảm phân mảnh của caching allocator: reserved bám sát
+# allocated hơn, thay vì giữ thừa 30-40%. Rất quan trọng khi dùng chung GPU.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from torch.amp import GradScaler, autocast
