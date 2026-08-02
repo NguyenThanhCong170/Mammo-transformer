@@ -306,7 +306,9 @@ def train(cfg: Config):
 
         if no_improve >= cfg.train.early_stopping_patience:
             print(f"  [P2] Early stop — không cải thiện {no_improve} epoch.")
-            break
+            # break
+        else:
+            print(f"  có cải thiện")
 
     # ── Test
     print("\n" + "=" * 60)
