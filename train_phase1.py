@@ -87,6 +87,9 @@ def train_one_epoch(
         scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
+        scale_after = scaler.get_scale()
+
+        
         if scaler.get_scale() >= scale_before:    # step thật sự đã chạy
             scheduler.step()                      # ← per-STEP, khớp total_steps
 
@@ -99,7 +102,8 @@ def train_one_epoch(
             lr_now = optimizer.param_groups[0]["lr"]
             print(f"  [P1] Epoch {epoch} | Step {step+1}/{len(loader)} | "
                   f"loss {loss_val:.4f} | avg {total_loss/n_batches:.4f} | lr {lr_now:.2e}")
-            logger.log({"train/step_loss": loss_val, "train/lr": lr_now}, step=global_step)
+            logger.log({"train/step_loss": loss_val, "train/lr": lr_now, "train/amp_scale": scale_after,       
+            "train/scale_dropped": scale_after < scale_before,}, step=global_step)
 
     return total_loss / max(1, n_batches), global_step, time.time() - t0
 
