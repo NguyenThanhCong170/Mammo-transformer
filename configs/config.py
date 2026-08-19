@@ -96,7 +96,7 @@ class TrainConfig:
     pretrained_phase1: bool = True          # khởi tạo từ ImageNet
     # Contrastive: batch CÀNG LỚN CÀNG TỐT (negative = 4*(B-1) mỗi anchor).
     # Đo trên A40 dùng chung ~22 GB. Chạy lại find_batch_size.py nếu GPU trống hơn.
-    batch_size_phase1: int = 12              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
+    batch_size_phase1: int = 10              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
     # LR cho FULL fine-tune Swin-V2-Base (88M param, unfrozen).
     # 1e-4 quá cao ở batch này — run trước phân kỳ ở epoch 8 (loss 1.95 → 2.59
     # rồi không hồi phục). Dải an toàn cho contrastive fine-tune ViT/Swin base
