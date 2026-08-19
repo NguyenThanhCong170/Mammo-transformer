@@ -97,7 +97,11 @@ class TrainConfig:
     # Contrastive: batch CÀNG LỚN CÀNG TỐT (negative = 4*(B-1) mỗi anchor).
     # Đo trên A40 dùng chung ~22 GB. Chạy lại find_batch_size.py nếu GPU trống hơn.
     batch_size_phase1: int = 12              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
-    lr_phase1: float = 1e-4
+    # LR cho FULL fine-tune Swin-V2-Base (88M param, unfrozen).
+    # 1e-4 quá cao ở batch này — run trước phân kỳ ở epoch 8 (loss 1.95 → 2.59
+    # rồi không hồi phục). Dải an toàn cho contrastive fine-tune ViT/Swin base
+    # là 2e-5 – 3e-5. Nếu tăng batch_size_phase1 thì scale LR theo căn bậc hai.
+    lr_phase1: float = 2.5e-5
     temperature: float = 0.1
     proj_hidden_dim: int = 2048
     proj_out_dim: int = 128
@@ -119,7 +123,9 @@ class TrainConfig:
 
     # Optimizer
     weight_decay: float = 1e-2
-    warmup_steps: int = 100                 # tính theo STEP, không phải epoch
+    # 100 step (~1/3 epoch) quá ngắn để backbone pretrained thích nghi với
+    # domain mammo. 500 step ≈ 1.8 epoch, êm hơn nhiều.
+    warmup_steps: int = 500                 # tính theo STEP, không phải epoch
     grad_clip: float = 1.0
 
     # Loss
@@ -129,6 +135,11 @@ class TrainConfig:
 
     # Misc
     mixed_precision: bool = True
+    # bfloat16 có dải mũ bằng fp32 → không tràn số, không cần GradScaler.
+    # Cần GPU Ampere trở lên (A40/A100/RTX 30xx+). Code tự fallback về fp16
+    # nếu torch.cuda.is_bf16_supported() trả về False.
+    # Đặt False để ép dùng fp16 (chỉ nên dùng khi cần so sánh).
+    prefer_bf16: bool = True
     save_top_k: int = 3
     early_stopping_patience: int = 8
     log_every_n_steps: int = 20

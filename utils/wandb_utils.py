@@ -49,14 +49,30 @@ class WandbLogger:
             )
             self.wandb = wandb
 
-            # step tuỳ ý cho biểu đồ theo step và theo epoch
+            # ── Trục x cho biểu đồ ────────────────────────────────────────
+            # Cách wandb phân giải (sdk/internal/handler.py):
+            #   1. Tra tên CHÍNH XÁC trong _metric_defines  → thắng mọi wildcard
+            #   2. Nếu không có, duyệt _metric_globs theo THỨ TỰ CHÈN và lấy
+            #      match ĐẦU TIÊN  → glob hẹp phải đăng ký TRƯỚC glob rộng
+            #
+            # LỖI CŨ: "train/*" đăng ký sau "train/step_*" thì không sao cho
+            # step_loss, nhưng nó nuốt luôn train/amp_scale (không có định nghĩa
+            # riêng) → amp_scale bị vẽ trên trục epoch, mà trong vòng lặp train
+            # thì "epoch" không được log cùng lúc → cả ~200 điểm của 1 epoch dồn
+            # vào 1 giá trị x. Biểu đồ trông phẳng lì và giấu sạch dao động.
             wandb.define_metric("global_step")
             wandb.define_metric("epoch")
+
+            # (a) Glob hẹp trước, glob rộng sau
             wandb.define_metric("train/step_*", step_metric="global_step")
-            wandb.define_metric("train/lr", step_metric="global_step")
             wandb.define_metric("train/*", step_metric="epoch")
             wandb.define_metric("val/*", step_metric="epoch")
             wandb.define_metric("test/*", step_metric="epoch")
+
+            # (b) Tên chính xác — luôn thắng glob, không phụ thuộc thứ tự
+            for _k in ("train/lr", "train/grad_norm",
+                       "train/amp_scale", "train/scale_dropped"):
+                wandb.define_metric(_k, step_metric="global_step")
 
             print(f"[wandb] Run: {self.run.name}  →  {self.run.url}")
         except Exception as e:

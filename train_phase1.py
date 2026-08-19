@@ -10,6 +10,7 @@ Chạy:
 """
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -56,12 +57,13 @@ def stack_views(images_dict, device):
 # ──────────────────────────────────────────────
 def train_one_epoch(
     backbone, proj_head, loader, optimizer, scheduler, criterion, scaler,
-    device, epoch, cfg, logger, global_step, amp_dtype,
+    device, epoch, cfg, logger, global_step, amp_dtype, use_amp, params,
 ):
     backbone.train()
     proj_head.train()
 
     total_loss, n_batches = 0.0, 0
+    n_skipped, n_nonfinite = 0, 0          # chẩn đoán sức khoẻ AMP
     t0 = time.time()
 
     for step, batch in enumerate(loader):
@@ -69,29 +71,48 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=scaler.is_enabled()):
+        # ── Forward: backbone + head chạy ở half precision
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             features = backbone(images)          # (B*V, D) — global-pooled
             z = proj_head(features)              # (B*V, out_dim)
-            z = z.reshape(B, V, -1)
-            loss = criterion(z)
+
+        # ── Loss LUÔN tính ở fp32.
+        # KHÔNG đủ nếu chỉ gọi .float() bên trong autocast: torch.matmul nằm
+        # trong autocast list nên PyTorch ép ngược nó về half. Phải tắt autocast
+        # tường minh. NT-Xent chia cho temperature=0.1 (khuếch đại 10x) nên đây
+        # là chỗ dễ tràn số nhất trong toàn bộ pipeline.
+        with autocast(device_type=device.type, enabled=False):
+            loss = criterion(z.float().reshape(B, V, -1))
+
+        # Lưới an toàn: nếu loss đã NaN/Inf thì backward chỉ làm hỏng weight.
+        if not torch.isfinite(loss):
+            n_nonfinite += 1
+            optimizer.zero_grad(set_to_none=True)
+            if n_nonfinite <= 5:
+                print(f"  [P1] ⚠ loss không hữu hạn ở step {step+1} → bỏ qua batch này.")
+            continue
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            list(backbone.parameters()) + list(proj_head.parameters()),
-            max_norm=cfg.train.grad_clip,
-        )
-        # GradScaler BỎ QUA optimizer.step() khi gradient inf/nan (hay xảy ra ở
-        # vài step đầu khi scale còn cao). Nếu vẫn gọi scheduler.step() thì LR
-        # schedule lệch pha so với số bước thật — và PyTorch cảnh báo.
+
+        # unscale_ chỉ có nghĩa khi đang dùng fp16 + GradScaler.
+        # Với bf16 scaler bị tắt, gradient vốn đã ở scale thật.
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=cfg.train.grad_clip)
+
+        # GradScaler BỎ QUA optimizer.step() khi gradient inf/nan. Nếu vẫn gọi
+        # scheduler.step() thì LR schedule lệch pha so với số bước thật.
         scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
         scale_after = scaler.get_scale()
 
-        
-        if scaler.get_scale() >= scale_before:    # step thật sự đã chạy
+        stepped = (not scaler.is_enabled()) or (scale_after >= scale_before)
+        if stepped:
             scheduler.step()                      # ← per-STEP, khớp total_steps
+        else:
+            n_skipped += 1
 
         loss_val = loss.item()
         total_loss += loss_val
@@ -100,19 +121,31 @@ def train_one_epoch(
 
         if (step + 1) % cfg.train.log_every_n_steps == 0:
             lr_now = optimizer.param_groups[0]["lr"]
+            gn = float(grad_norm)
             print(f"  [P1] Epoch {epoch} | Step {step+1}/{len(loader)} | "
-                  f"loss {loss_val:.4f} | avg {total_loss/n_batches:.4f} | lr {lr_now:.2e}")
-            logger.log({"train/step_loss": loss_val, "train/lr": lr_now, "train/amp_scale": scale_after,       
-            "train/scale_dropped": scale_after < scale_before,}, step=global_step)
+                  f"loss {loss_val:.4f} | avg {total_loss/n_batches:.4f} | "
+                  f"lr {lr_now:.2e} | grad_norm {gn:.2f}")
+            logger.log({
+                "train/step_loss": loss_val,
+                "train/lr": lr_now,
+                "train/grad_norm": gn if math.isfinite(gn) else -1.0,
+                "train/amp_scale": scale_after,
+                "train/scale_dropped": float(not stepped),
+            }, step=global_step)
 
-    return total_loss / max(1, n_batches), global_step, time.time() - t0
+    stats = {
+        "skipped": n_skipped,
+        "nonfinite": n_nonfinite,
+        "total": n_batches + n_nonfinite,
+    }
+    return total_loss / max(1, n_batches), global_step, time.time() - t0, stats
 
 
 # ──────────────────────────────────────────────
 # Validate (contrastive loss trên val set, không augment)
 # ──────────────────────────────────────────────
 @torch.no_grad()
-def validate(backbone, proj_head, loader, criterion, device, scaler, amp_dtype):
+def validate(backbone, proj_head, loader, criterion, device, amp_dtype, use_amp):
     backbone.eval()
     proj_head.eval()
 
@@ -121,9 +154,12 @@ def validate(backbone, proj_head, loader, criterion, device, scaler, amp_dtype):
         images, B, V = stack_views(batch["images"], device)
         if B < 2:
             continue                              # cần ít nhất 2 bệnh nhân để có negative
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=scaler.is_enabled()):
-            z = proj_head(backbone(images)).reshape(B, V, -1)
-            loss = criterion(z)
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            z = proj_head(backbone(images))
+        with autocast(device_type=device.type, enabled=False):
+            loss = criterion(z.float().reshape(B, V, -1))
+        if not torch.isfinite(loss):
+            continue
         total_loss += loss.item()
         n_batches += 1
 
@@ -136,8 +172,28 @@ def validate(backbone, proj_head, loader, criterion, device, scaler, amp_dtype):
 def main(cfg: Config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = cfg.train.mixed_precision and device.type == "cuda"
-    amp_dtype = torch.float16 if use_amp else torch.float32
-    print(f"\n[Phase 1] Device: {device} | AMP: {use_amp}")
+
+    # ── Chọn dtype cho AMP ────────────────────────────────────────────────
+    # bfloat16 có DẢI MŨ y hệt fp32 (8 bit exponent) nên không bao giờ tràn số,
+    # và vì thế KHÔNG cần loss scaling → GradScaler bị tắt hoàn toàn.
+    # fp16 chỉ biểu diễn tới ~65504; cosine-attention của Swin-V2 (logit_scale
+    # exp tới 100) vượt ngưỡng đó → gradient inf → GradScaler tụt về 2^-11 →
+    # gradient underflow về 0 → model không học được gì. Đó là lỗi của run cũ.
+    use_bf16 = use_amp and getattr(cfg.train, "prefer_bf16", True) and torch.cuda.is_bf16_supported()
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+    elif use_amp:
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
+    # fp16 mới cần scaler; bf16 và fp32 thì không.
+    scaler_enabled = use_amp and not use_bf16
+
+    print(f"\n[Phase 1] Device: {device} | AMP: {use_amp} | dtype: {amp_dtype}")
+    if use_amp and not use_bf16:
+        print("[Phase 1] ⚠ GPU không hỗ trợ bfloat16 → dùng fp16 + GradScaler(init_scale=1024). "
+              "Theo dõi train/amp_scale: nếu tụt xuống dưới 1.0 thì AMP đang hỏng, "
+              "hãy đặt cfg.train.mixed_precision = False.")
 
     out_dir = Path(cfg.train.output_dir) / cfg.train.experiment_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -181,14 +237,21 @@ def main(cfg: Config):
 
     # ── Loss / Optim / Sched / AMP
     criterion = MultiViewNTXentLoss(temperature=cfg.train.temperature)
+    # Danh sách param dựng 1 lần — trước đây build lại mỗi step trong clip_grad_norm_.
+    params = list(backbone.parameters()) + list(proj_head.parameters())
     optimizer = AdamW(
-        list(backbone.parameters()) + list(proj_head.parameters()),
+        params,
         lr=cfg.train.lr_phase1,
         weight_decay=cfg.train.weight_decay,
     )
     total_steps = max(1, len(train_loader) * cfg.train.epochs_phase1)
     scheduler = build_scheduler(optimizer, cfg.train.warmup_steps, total_steps)
-    scaler = GradScaler(device=device.type, enabled=use_amp)
+    # init_scale=1024 thay vì mặc định 65536: khởi đầu thấp hơn nên không phải
+    # đốt hàng chục step đầu để halve dần xuống vùng an toàn.
+    scaler = GradScaler(device=device.type, enabled=scaler_enabled, init_scale=1024.0)
+    print(f"[Phase 1] GradScaler: {'BẬT (fp16)' if scaler_enabled else 'TẮT (không cần với bf16/fp32)'}")
+    print(f"[Phase 1] LR: {cfg.train.lr_phase1:.1e} | warmup: {cfg.train.warmup_steps} step "
+          f"| total: {total_steps} step ({len(train_loader)} step/epoch)")
 
     # ── Loop
     ckpt_path = out_dir / cfg.train.phase1_ckpt_name
@@ -200,21 +263,30 @@ def main(cfg: Config):
     for epoch in range(1, cfg.train.epochs_phase1 + 1):
         print(f"\n── [Phase 1] Epoch {epoch}/{cfg.train.epochs_phase1}")
 
-        train_loss, global_step, elapsed = train_one_epoch(
+        train_loss, global_step, elapsed, stats = train_one_epoch(
             backbone, proj_head, train_loader, optimizer, scheduler,
-            criterion, scaler, device, epoch, cfg, logger, global_step, amp_dtype,
+            criterion, scaler, device, epoch, cfg, logger, global_step,
+            amp_dtype, use_amp, params,
         )
-        val_loss = validate(backbone, proj_head, val_loader, criterion, device, scaler, amp_dtype)
+        val_loss = validate(backbone, proj_head, val_loader, criterion, device, amp_dtype, use_amp)
         lr_now = optimizer.param_groups[0]["lr"]
 
+        skip_rate = (stats["skipped"] + stats["nonfinite"]) / max(1, stats["total"])
         print(f"  [P1] Epoch {epoch} | train {train_loss:.4f} | val {val_loss:.4f} | "
               f"lr {lr_now:.2e} | {elapsed:.0f}s")
+        print(f"  [P1] AMP: bỏ qua {stats['skipped']} step (inf/nan grad), "
+              f"{stats['nonfinite']} batch loss không hữu hạn "
+              f"→ {skip_rate*100:.1f}% | scale hiện tại {scaler.get_scale():.4g}")
+        if skip_rate > 0.05:
+            print("  [P1] ⚠ Trên 5% step bị bỏ qua — AMP đang không ổn định. "
+                  "Cân nhắc tắt mixed_precision hoặc hạ LR thêm.")
 
         logger.log_epoch(epoch, {
             "train/loss": train_loss,
             "val/loss": val_loss,
             "train/epoch_lr": lr_now,
             "train/epoch_time_s": elapsed,
+            "train/epoch_skip_rate": skip_rate,
         })
         history.append({"epoch": epoch, "train_loss": train_loss,
                         "val_loss": val_loss, "time": round(elapsed, 1)})

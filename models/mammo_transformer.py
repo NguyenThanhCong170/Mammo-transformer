@@ -43,12 +43,6 @@ class SwinV2Backbone(nn.Module):
     ):
         super().__init__()
 
-        # ── strict_img_size=False là BẮT BUỘC với ảnh mammo ──
-        # timm precompute attn_mask ngay trong __init__ tại feat_size danh định,
-        # và window_partition() yêu cầu feat_size chia hết cho window_size (=16).
-        # Với (1856, 704): stage 2 cho 232x88 mà 232/16 = 14.5 → RuntimeError.
-        # strict_img_size=False ⇒ dynamic_mask=True ⇒ timm bỏ precompute và
-        # tính mask lúc runtime; _attn() tự pad H/W về bội của window_size.
         common = dict(
             pretrained=pretrained,
             img_size=img_size,
@@ -124,11 +118,6 @@ class SwinV2Backbone(nn.Module):
 # 2. View + Positional Embedding
 # ──────────────────────────────────────────────
 class ViewEmbedding(nn.Module):
-    """
-    4 embedding riêng cho L_MLO, L_CC, R_MLO, R_CC (broadcast lên mọi token)
-    + 1 positional embedding dùng chung cho các vị trí token trong lưới.
-    """
-
     def __init__(self, embed_dim: int, num_tokens: int):
         super().__init__()
         self.view_emb = nn.Parameter(torch.zeros(len(VIEW_KEYS), 1, embed_dim))
@@ -216,11 +205,7 @@ class AttentionPool(nn.Module):
 # 5. Ipsilateral Fusion (MLO ↔ CC, cùng bên)
 # ──────────────────────────────────────────────
 class IpsilateralFusion(nn.Module):
-    """
-    MLO attends to CC, CC attends to MLO, lặp num_layers lần.
-    Output: chuỗi token nối lại (B, 2N, D) — giữ nguyên token để tầng
-    bilateral vẫn còn thông tin không gian để so sánh.
-    """
+
 
     def __init__(self, embed_dim, num_heads, num_layers, attn_dropout, ffn_dropout, ffn_expansion=4):
         super().__init__()
@@ -236,7 +221,6 @@ class IpsilateralFusion(nn.Module):
 
     def forward(self, mlo: torch.Tensor, cc: torch.Tensor) -> torch.Tensor:
         for mlo_layer, cc_layer in zip(self.mlo_layers, self.cc_layers):
-            # dùng bản cũ của mlo làm context cho cc → tránh phụ thuộc thứ tự
             mlo_prev = mlo
             mlo = mlo_layer(query=mlo, context=cc)
             cc = cc_layer(query=cc, context=mlo_prev)
@@ -247,11 +231,6 @@ class IpsilateralFusion(nn.Module):
 # 6. Bilateral Fusion (Left ↔ Right)
 # ──────────────────────────────────────────────
 class BilateralFusion(nn.Module):
-    """
-    So sánh Left ↔ Right ở mức token, rồi attention-pool mỗi bên
-    thành 1 vector và merge → (B, D).
-    """
-
     def __init__(self, embed_dim, num_heads, num_layers, attn_dropout, ffn_dropout, ffn_expansion=4):
         super().__init__()
         self.left_layers = nn.ModuleList([
