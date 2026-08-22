@@ -8,6 +8,7 @@ Chạy:
 """
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -73,11 +74,13 @@ class CheckpointManager:
 # ──────────────────────────────────────────────
 def train_one_epoch(
     model, loader, optimizer, scheduler, criterion, scaler,
-    device, cfg, epoch, logger, global_step, amp_dtype,
+    device, cfg, epoch, logger, global_step, amp_dtype, use_amp, trainable_params,
 ):
     model.train()          # override trong MammoTransformer giữ backbone ở eval nếu frozen
     total_loss = 0.0
     accumulate_steps = cfg.train.accumulate_grad_steps
+    n_skipped, n_nonfinite = 0, 0
+    grad_norm = torch.tensor(0.0)
 
     metrics_calc = MultiLabelMetricsCalculator(
         num_classes=cfg.data.num_classes,
@@ -90,25 +93,39 @@ def train_one_epoch(
         images = {k: v.to(device, non_blocking=True) for k, v in batch["images"].items()}
         labels = batch["label"].to(device, non_blocking=True)
 
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=scaler.is_enabled()):
+        # Forward ở half precision; loss LUÔN ở fp32.
+        # FocalLoss có log/exp và sigmoid — dưới fp16 rất dễ mất chính xác ở
+        # đuôi phân phối, mà focal loss thì sống bằng đúng cái đuôi đó.
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(images)
-            loss = criterion(logits, labels) / accumulate_steps
+        with autocast(device_type=device.type, enabled=False):
+            loss = criterion(logits.float(), labels) / accumulate_steps
+
+        if not torch.isfinite(loss):
+            n_nonfinite += 1
+            if n_nonfinite <= 5:
+                print(f"  [P2] ⚠ loss không hữu hạn ở step {step+1} → bỏ qua batch này.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         scaler.scale(loss).backward()
 
         if (step + 1) % accumulate_steps == 0 or (step + 1) == len(loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                max_norm=cfg.train.grad_clip,
-            )
+            # unscale_ chỉ có nghĩa với fp16 + GradScaler; bf16 thì scaler tắt.
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_params, max_norm=cfg.train.grad_clip)
             # Xem giải thích trong train_phase1.py: scaler có thể bỏ qua step.
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            if scaler.get_scale() >= scale_before:
+            stepped = (not scaler.is_enabled()) or (scaler.get_scale() >= scale_before)
+            if stepped:
                 scheduler.step()           # ← theo OPTIMIZER STEP, không theo epoch
+            else:
+                n_skipped += 1
             global_step += 1
 
         batch_loss = loss.item() * accumulate_steps
@@ -117,13 +134,22 @@ def train_one_epoch(
 
         if (step + 1) % cfg.train.log_every_n_steps == 0:
             lr_now = optimizer.param_groups[0]["lr"]
+            gn = float(grad_norm)
             print(f"  [P2] Epoch {epoch} | Step {step+1}/{len(loader)} | "
-                  f"loss {batch_loss:.4f} | avg {total_loss/(step+1):.4f} | lr {lr_now:.2e}")
-            logger.log({"train/step_loss": batch_loss, "train/lr": lr_now}, step=global_step)
+                  f"loss {batch_loss:.4f} | avg {total_loss/(step+1):.4f} | "
+                  f"lr {lr_now:.2e} | grad_norm {gn:.2f}")
+            logger.log({
+                "train/step_loss": batch_loss,
+                "train/lr": lr_now,
+                "train/grad_norm": gn if math.isfinite(gn) else -1.0,
+                "train/amp_scale": scaler.get_scale(),
+            }, step=global_step)
 
     metrics = metrics_calc.compute()
     metrics["loss"] = total_loss / max(1, len(loader))
     metrics["time"] = time.time() - t0
+    metrics["amp_skipped"] = n_skipped
+    metrics["amp_nonfinite"] = n_nonfinite
     return metrics, global_step
 
 
@@ -131,7 +157,7 @@ def train_one_epoch(
 # Validate / Test
 # ──────────────────────────────────────────────
 @torch.no_grad()
-def validate(model, loader, criterion, device, cfg, scaler, amp_dtype,
+def validate(model, loader, criterion, device, cfg, amp_dtype, use_amp,
              split: str = "Val", thresholds: Optional[list] = None) -> dict:
     model.eval()
     total_loss = 0.0
@@ -144,9 +170,10 @@ def validate(model, loader, criterion, device, cfg, scaler, amp_dtype,
         images = {k: v.to(device, non_blocking=True) for k, v in batch["images"].items()}
         labels = batch["label"].to(device, non_blocking=True)
 
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=scaler.is_enabled()):
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(images)
-            loss = criterion(logits, labels)
+        with autocast(device_type=device.type, enabled=False):
+            loss = criterion(logits.float(), labels)
 
         total_loss += loss.item()
         metrics_calc.update(logits.float(), labels)
@@ -184,8 +211,24 @@ def build_optimizer_scheduler(model, lr: float, cfg: Config, total_optim_steps: 
 def train(cfg: Config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = cfg.train.mixed_precision and device.type == "cuda"
-    amp_dtype = torch.float16 if use_amp else torch.float32
-    print(f"\n[Phase 2] Device: {device} | AMP: {use_amp}")
+
+    # ── Chọn dtype cho AMP (giống hệt train_phase1.py) ────────────────────
+    # bfloat16 có dải mũ bằng fp32 → không tràn số → KHÔNG cần GradScaler.
+    # fp16 chỉ tới ~65504; cosine-attention của Swin-V2 vượt ngưỡng đó và làm
+    # GradScaler tụt dần tới mức gradient underflow về 0.
+    use_bf16 = use_amp and getattr(cfg.train, "prefer_bf16", True) and torch.cuda.is_bf16_supported()
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+    elif use_amp:
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
+    scaler_enabled = use_amp and not use_bf16
+
+    print(f"\n[Phase 2] Device: {device} | AMP: {use_amp} | dtype: {amp_dtype}")
+    if use_amp and not use_bf16:
+        print("[Phase 2] CANH BAO: GPU khong ho tro bfloat16 -> dung fp16 + GradScaler. "
+              "Theo doi train/amp_scale: tut xuong duoi 1.0 la AMP dang hong.")
 
     out_dir = Path(cfg.train.output_dir) / cfg.train.experiment_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -257,7 +300,11 @@ def train(cfg: Config):
     total_optim_steps = steps_per_epoch * cfg.train.epochs_phase2
     optimizer, scheduler = build_optimizer_scheduler(
         model, cfg.train.lr_phase2, cfg, total_optim_steps)
-    scaler = GradScaler(device=device.type, enabled=use_amp)
+    scaler = GradScaler(device=device.type, enabled=scaler_enabled, init_scale=1024.0)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"[Phase 2] GradScaler: {'BAT (fp16)' if scaler_enabled else 'TAT (khong can voi bf16/fp32)'}")
+    print(f"[Phase 2] LR: {cfg.train.lr_phase2:.1e} | warmup: {cfg.train.warmup_steps} step "
+          f"| total: {total_optim_steps} optim-step ({steps_per_epoch} step/epoch)")
 
     ckpt_manager = CheckpointManager(
         output_dir=str(out_dir),
@@ -274,10 +321,14 @@ def train(cfg: Config):
 
         train_metrics, global_step = train_one_epoch(
             model, train_loader, optimizer, scheduler, criterion, scaler,
-            device, cfg, epoch, logger, global_step, amp_dtype,
+            device, cfg, epoch, logger, global_step, amp_dtype, use_amp, trainable_params,
         )
         val_metrics = validate(model, val_loader, criterion, device, cfg,
-                               scaler, amp_dtype, split="Val")
+                               amp_dtype, use_amp, split="Val")
+
+        if train_metrics["amp_skipped"] or train_metrics["amp_nonfinite"]:
+            print(f"  [P2] AMP: bo qua {train_metrics['amp_skipped']} optim-step, "
+                  f"{train_metrics['amp_nonfinite']} batch loss khong huu han.")
 
         lr_now = optimizer.param_groups[0]["lr"]
         epoch_log = {"epoch": epoch, "train": train_metrics, "val": val_metrics,
@@ -304,11 +355,16 @@ def train(cfg: Config):
               f"macro-AUC {val_metrics['macro_auc']:.4f} | best AP {best_score:.4f} | "
               f"{epoch_log['time']}s")
 
+        # LỖI CŨ: `break` bị comment out nên early stopping không bao giờ chạy —
+        # vòng lặp luôn chạy đủ 100 epoch dù val đã ngừng cải thiện từ lâu.
+        # Nhánh else cũng in "có cải thiện" sai: nó là nhánh "chưa hết kiên nhẫn",
+        # không phải nhánh "val tốt lên".
+        # Muốn tắt early stopping thì đặt cfg.train.early_stopping_patience rất lớn.
         if no_improve >= cfg.train.early_stopping_patience:
-            print(f"  [P2] Early stop — không cải thiện {no_improve} epoch.")
-            # break
-        else:
-            print(f"  có cải thiện")
+            print(f"  [P2] Early stop — khong cai thien {no_improve} epoch.")
+            break
+        elif no_improve > 0:
+            print(f"  [P2] Chua cai thien {no_improve}/{cfg.train.early_stopping_patience} epoch.")
 
     # ── Test
     print("\n" + "=" * 60)
@@ -322,7 +378,7 @@ def train(cfg: Config):
         print(f"  Nạp checkpoint tốt nhất: {best_ckpt.name}")
 
     test_metrics = validate(model, test_loader, criterion, device, cfg,
-                            scaler, amp_dtype, split="Test", thresholds=best_thresholds)
+                            amp_dtype, use_amp, split="Test", thresholds=best_thresholds)
     logger.log_epoch(cfg.train.epochs_phase2 + 1, flatten_metrics(test_metrics, "test"))
     logger.set_summary({f"test_{k}": v for k, v in test_metrics["macro"].items()})
 
