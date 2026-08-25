@@ -7,12 +7,16 @@ Chạy:
     python train_phase2.py     # sau
 """
 
+import argparse
 import json
 import math
 import os
+import random
 import time
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 # PHẢI đặt TRƯỚC khi import torch (xem giải thích trong train_phase1.py).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -29,6 +33,24 @@ from utils.losses import FocalLoss, MultiLabelMetricsCalculator
 from utils.wandb_utils import WandbLogger, flatten_metrics
 
 CLASS_NAMES = ["no_finding", "mass", "calcification", "asymmetry"]
+
+
+# ──────────────────────────────────────────────
+# Seed — BẮT BUỘC cho ablation
+# ──────────────────────────────────────────────
+def set_seed(seed: int):
+    """
+    Cố định seed cho khởi tạo trọng số, augmentation và shuffle.
+
+    Với ablation A/B (có phase-1 vs ImageNet), nếu KHÔNG seed thì hai run có
+    head khởi tạo khác nhau và thứ tự batch khác nhau — một phần chênh lệch
+    macro-AP sẽ là nhiễu, không phải hiệu ứng của phase 1. Trước đây file này
+    không seed gì cả.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # ──────────────────────────────────────────────
@@ -193,9 +215,19 @@ def validate(model, loader, criterion, device, cfg, amp_dtype, use_amp,
 # Optimizer + Scheduler (chỉ train non-backbone)
 # ──────────────────────────────────────────────
 def build_optimizer_scheduler(model, lr: float, cfg: Config, total_optim_steps: int):
-    params = [p for n, p in model.named_parameters()
-              if not n.startswith("backbone") and p.requires_grad]
-    optimizer = AdamW(params, lr=lr, weight_decay=cfg.train.weight_decay)
+    if cfg.train.unfreeze_backbone:
+        # LR phân tầng: backbone (đã pretrain) đi chậm hơn head (ngẫu nhiên).
+        # get_param_groups() đã có sẵn trong mammo_transformer.py nhưng trước
+        # đây không ai gọi — hàm này lọc bỏ hẳn param backbone.
+        groups = model.get_param_groups(
+            lr, backbone_lr_multiplier=cfg.train.backbone_lr_multiplier)
+        optimizer = AdamW(groups, weight_decay=cfg.train.weight_decay)
+        n_g = [(len(g["params"]), g["lr"]) for g in groups]
+        print(f"[Optim] Param groups: " + " | ".join(f"{n} tensor @ lr {l:.1e}" for n, l in n_g))
+    else:
+        params = [p for n, p in model.named_parameters()
+                  if not n.startswith("backbone") and p.requires_grad]
+        optimizer = AdamW(params, lr=lr, weight_decay=cfg.train.weight_decay)
 
     effective_warmup = max(1, min(cfg.train.warmup_steps, total_optim_steps // 2))
     warmup = LinearLR(optimizer, start_factor=0.1, total_iters=effective_warmup)
@@ -266,22 +298,39 @@ def train(cfg: Config):
         ffn_expansion=cfg.model.ffn_expansion,
     ).to(device)
 
-    # ── Nạp backbone từ phase 1 (bước này trước đây BỊ THIẾU
-    #    → toàn bộ contrastive learning của phase 1 bị vứt bỏ)
-    phase1_ckpt = out_dir / cfg.train.phase1_ckpt_name
+    # ── Khởi tạo backbone: phase-1 contrastive HAY ImageNet
+    # Đây chính là trục ablation. --no-phase1 đi nhánh else.
     if cfg.train.load_phase1_backbone:
+        phase1_ckpt = Path(cfg.train.phase1_ckpt_path) if cfg.train.phase1_ckpt_path \
+            else Path(cfg.train.output_dir) / cfg.train.experiment_name / cfg.train.phase1_ckpt_name
         if phase1_ckpt.exists():
             model.load_backbone_weights(str(phase1_ckpt), device=device)
+            backbone_init = f"phase1 ({phase1_ckpt.name})"
         else:
-            print(f"[Phase 2] ⚠ Không tìm thấy {phase1_ckpt}. "
-                  f"Đang dùng backbone ImageNet — hãy chạy train_phase1.py trước.")
+            # DỪNG chứ không âm thầm rơi về ImageNet: nếu không, một run
+            # "có phase-1" thực chất lại là run ImageNet và ablation vô nghĩa.
+            raise FileNotFoundError(
+                f"Khong tim thay checkpoint phase 1: {phase1_ckpt}\n"
+                f"  - Chay train_phase1.py truoc, HOAC\n"
+                f"  - Chi ro duong dan:  --phase1-ckpt <path>, HOAC\n"
+                f"  - Co y dung ImageNet: --no-phase1"
+            )
+    else:
+        backbone_init = "ImageNet" if cfg.model.backbone_pretrained else "random"
+        print(f"[Phase 2] Bo qua checkpoint phase 1 — backbone khoi tao tu {backbone_init}.")
     model.to(device)
 
-    # ── Freeze backbone
+    # ── Freeze / unfreeze backbone
     print("\n" + "=" * 60)
-    print("  Frozen backbone — train cross-attention + classifier")
-    print("=" * 60)
-    model.freeze_backbone()
+    if cfg.train.unfreeze_backbone:
+        print(f"  Backbone init: {backbone_init}  |  UNFROZEN (fine-tune toan bo)")
+        print("=" * 60)
+        model.unfreeze_backbone()          # bật lại grad-checkpointing
+    else:
+        print(f"  Backbone init: {backbone_init}  |  FROZEN")
+        print("  Train cross-attention + classifier")
+        print("=" * 60)
+        model.freeze_backbone()
 
     counts = model.count_parameters()
     print(f"[Model] Backbone: {counts['backbone']:,} | Other: {counts['other']:,} | "
@@ -404,7 +453,121 @@ def train(cfg: Config):
 
 
 # ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Phase 2 — multi-view classification. Moi co deu ghi de config.py.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Vi du — ablation "phase 1 co ich khong":
+
+  # A: backbone tu phase 1 (contrastive)
+  python train_phase2.py --exp-name abl_phase1  --phase1 \\
+      --phase1-ckpt outputs/mammo_transformer_v1/phase1_backbone.pt
+
+  # B: backbone tu ImageNet  <-- cai ban dang muon chay
+  python train_phase2.py --exp-name abl_imagenet --no-phase1
+
+Hai run PHAI dung cung --seed va cung moi sieu tham so khac,
+neu khong thi chenh lech macro-AP la nhieu chu khong phai hieu ung phase 1.
+
+  # Head nho hon + LR thap hon (khuyen nghi sau khi thay run 162M param sup)
+  python train_phase2.py --exp-name abl_imagenet --no-phase1 \\
+      --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --grad-clip 0.5 --epochs 30
+
+  # Fine-tune ca backbone (chay SAU khi head da hoi tu)
+  python train_phase2.py --exp-name ft --unfreeze-backbone --backbone-lr-mult 0.05
+""")
+
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--phase1", dest="load_phase1", action="store_true", default=None,
+                   help="Nap backbone tu checkpoint phase 1 (mac dinh theo config).")
+    g.add_argument("--no-phase1", dest="load_phase1", action="store_false",
+                   help="BO QUA phase 1 — backbone khoi tao tu ImageNet.")
+    p.add_argument("--phase1-ckpt", type=str, default=None,
+                   help="Duong dan toi phase1_backbone.pt. Mac dinh: "
+                        "<output_dir>/<experiment_name>/phase1_backbone.pt")
+
+    p.add_argument("--exp-name", type=str, default=None,
+                   help="Ten thi nghiem — quyet dinh thu muc output va ten run wandb. "
+                        "DAT KHAC NHAU cho moi nhanh ablation de checkpoint khong de len nhau.")
+    p.add_argument("--seed", type=int, default=None, help="Seed (mac dinh: data.seed).")
+
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None, help="lr_phase2")
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--warmup-steps", type=int, default=None)
+    p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--patience", type=int, default=None, help="early_stopping_patience")
+
+    p.add_argument("--embed-dim", type=int, default=None,
+                   help="Chieu cua khoi fusion. 1024 -> 162M param; 256 -> 7.5M.")
+    p.add_argument("--ffn-expansion", type=int, default=None)
+    p.add_argument("--ipsi-layers", type=int, default=None)
+    p.add_argument("--bilateral-layers", type=int, default=None)
+    p.add_argument("--token-grid", type=str, default=None,
+                   help='Vi du "8,4" hoac "16,6". "none" = giu nguyen 319 token.')
+
+    p.add_argument("--unfreeze-backbone", action="store_true", default=None,
+                   help="Fine-tune ca backbone (cham hon nhieu, bat grad-checkpointing).")
+    p.add_argument("--backbone-lr-mult", type=float, default=None,
+                   help="LR cua backbone = lr * he so nay. Mac dinh 0.05.")
+
+    p.add_argument("--no-wandb", action="store_true", help="Tat wandb logging.")
+    return p
+
+
+def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
+    """Ghi de config bang cac co CLI. None = khong dung toi, giu nguyen config.py."""
+    t, m, d, w = cfg.train, cfg.model, cfg.data, cfg.wandb
+
+    if args.load_phase1 is not None:   t.load_phase1_backbone = args.load_phase1
+    if args.phase1_ckpt is not None:   t.phase1_ckpt_path = args.phase1_ckpt
+    if args.exp_name is not None:      t.experiment_name = args.exp_name
+    if args.seed is not None:          d.seed = args.seed
+
+    if args.epochs is not None:        t.epochs_phase2 = args.epochs
+    if args.lr is not None:            t.lr_phase2 = args.lr
+    if args.batch_size is not None:    t.batch_size = args.batch_size
+    if args.warmup_steps is not None:  t.warmup_steps = args.warmup_steps
+    if args.grad_clip is not None:     t.grad_clip = args.grad_clip
+    if args.patience is not None:      t.early_stopping_patience = args.patience
+
+    if args.embed_dim is not None:         m.embed_dim = args.embed_dim
+    if args.ffn_expansion is not None:     m.ffn_expansion = args.ffn_expansion
+    if args.ipsi_layers is not None:       m.num_ipsi_layers = args.ipsi_layers
+    if args.bilateral_layers is not None:  m.num_bilateral_layers = args.bilateral_layers
+    if args.token_grid is not None:
+        tg = args.token_grid.strip().lower()
+        m.token_grid = None if tg in ("none", "null", "") else \
+            tuple(int(x) for x in tg.replace("x", ",").split(","))
+
+    if args.unfreeze_backbone is not None:  t.unfreeze_backbone = args.unfreeze_backbone
+    if args.backbone_lr_mult is not None:   t.backbone_lr_multiplier = args.backbone_lr_mult
+    if args.no_wandb:                       w.enabled = False
+
+    return cfg
+
+
+# ──────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    train(Config())
+    args = build_argparser().parse_args()
+    cfg = apply_overrides(Config(), args)
+    set_seed(cfg.data.seed)
+
+    print("=" * 60)
+    print(f"  exp_name        : {cfg.train.experiment_name}")
+    print(f"  backbone init   : {'phase1' if cfg.train.load_phase1_backbone else 'ImageNet'}")
+    print(f"  backbone        : {'UNFROZEN' if cfg.train.unfreeze_backbone else 'frozen'}")
+    print(f"  embed_dim       : {cfg.model.embed_dim} | ffn_exp {cfg.model.ffn_expansion} "
+          f"| ipsi {cfg.model.num_ipsi_layers} | bila {cfg.model.num_bilateral_layers}")
+    print(f"  token_grid      : {cfg.model.token_grid}")
+    print(f"  lr / epochs     : {cfg.train.lr_phase2:.1e} / {cfg.train.epochs_phase2}")
+    print(f"  batch / clip    : {cfg.train.batch_size} / {cfg.train.grad_clip}")
+    print(f"  seed            : {cfg.data.seed}")
+    print("=" * 60)
+
+    train(cfg)

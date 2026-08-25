@@ -9,11 +9,15 @@ Chạy:
     python train_phase1.py
 """
 
+import argparse
 import json
 import math
 import os
+import random
 import time
 from pathlib import Path
+
+import numpy as np
 
 # PHẢI đặt TRƯỚC khi import torch — biến này chỉ có tác dụng lúc CUDA khởi tạo.
 # expandable_segments giảm phân mảnh của caching allocator: reserved bám sát
@@ -29,8 +33,18 @@ from configs.config import Config
 from data.dataset import build_dataloaders, VIEW_KEYS
 from models.mammo_transformer import SwinV2Backbone
 from models.projection_head import ProjectionHead
-from utils.Supcon_loss import MultiViewNTXentLoss
+from utils.Supcon_loss import MultiViewNTXentLoss, build_view_groups
 from utils.wandb_utils import WandbLogger
+
+
+# ──────────────────────────────────────────────
+# Seed — bắt buộc nếu muốn so sánh các nhánh ablation
+# ──────────────────────────────────────────────
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # ──────────────────────────────────────────────
@@ -236,7 +250,20 @@ def main(cfg: Config):
         logger.watch(backbone, log_freq=cfg.wandb.log_every_n_steps)
 
     # ── Loss / Optim / Sched / AMP
-    criterion = MultiViewNTXentLoss(temperature=cfg.train.temperature)
+    # ── Cách ghép positive — đây là trục ablation của phase 1.
+    # "patient"     : cả 4 view cùng bệnh nhân là positive (bản gốc)
+    # "ipsilateral" : chỉ cùng bên vú; vú đối bên thành hard negative
+    # view_groups suy ra từ VIEW_KEYS của dataset nên luôn khớp thứ tự
+    # mà stack_views() xếp tensor.
+    mode = getattr(cfg.train, "contrastive_positives", "patient")
+    view_groups = build_view_groups(VIEW_KEYS, mode)
+    criterion = MultiViewNTXentLoss(
+        temperature=cfg.train.temperature, view_groups=view_groups)
+    print(f"[Phase 1] Positive pairing: {mode}  |  VIEW_KEYS={VIEW_KEYS}  "
+          f"|  view_groups={view_groups}")
+    if view_groups is None:
+        print("[Phase 1] CANH BAO: che do 'patient' keo vu trai va vu phai lai gan nhau, "
+              "pha tin hieu cua lop asymmetry. Dung --positives ipsilateral.")
     # Danh sách param dựng 1 lần — trước đây build lại mỗi step trong clip_grad_norm_.
     params = list(backbone.parameters()) + list(proj_head.parameters())
     optimizer = AdamW(
@@ -325,8 +352,82 @@ def main(cfg: Config):
 
 
 # ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Phase 1 — contrastive pretrain backbone. Moi co deu ghi de config.py.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+QUAN TRONG: --exp-name quyet dinh thu muc ghi phase1_backbone.pt.
+Neu khong doi, run moi se DE LEN checkpoint phase 1 cu.
+
+  # Nhanh moi: chi ghep positive cung ben vu
+  python train_phase1.py --exp-name p1_ipsi --positives ipsilateral --seed 42
+
+  # Nhanh cu (de tai lap): ca 4 view cung benh nhan
+  python train_phase1.py --exp-name p1_patient --positives patient --seed 42
+
+Sau do danh gia bang phase 2, dung cung mot cau hinh head cho ca ba nhanh:
+
+  python train_phase2.py --exp-name abl_ipsi --phase1 \\
+      --phase1-ckpt outputs/p1_ipsi/phase1_backbone.pt \\
+      --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --grad-clip 0.5 --epochs 30 --seed 42
+""")
+    p.add_argument("--positives", choices=["patient", "ipsilateral"], default=None,
+                   help="Cach ghep positive. ipsilateral = chi cung ben vu, "
+                        "vu doi ben thanh hard negative.")
+    p.add_argument("--exp-name", type=str, default=None,
+                   help="Ten thi nghiem — quyet dinh thu muc output. DAT KHAC NHAU "
+                        "cho moi nhanh, neu khong se de len checkpoint cu.")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None, help="lr_phase1")
+    p.add_argument("--batch-size", type=int, default=None, help="batch_size_phase1")
+    p.add_argument("--temperature", type=float, default=None)
+    p.add_argument("--warmup-steps", type=int, default=None)
+    p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--no-wandb", action="store_true")
+    return p
+
+
+def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
+    t, d, w = cfg.train, cfg.data, cfg.wandb
+    if args.positives is not None:     t.contrastive_positives = args.positives
+    if args.exp_name is not None:      t.experiment_name = args.exp_name
+    if args.seed is not None:          d.seed = args.seed
+    if args.epochs is not None:        t.epochs_phase1 = args.epochs
+    if args.lr is not None:            t.lr_phase1 = args.lr
+    if args.batch_size is not None:    t.batch_size_phase1 = args.batch_size
+    if args.temperature is not None:   t.temperature = args.temperature
+    if args.warmup_steps is not None:  t.warmup_steps = args.warmup_steps
+    if args.grad_clip is not None:     t.grad_clip = args.grad_clip
+    if args.patience is not None:      t.early_stopping_patience = args.patience
+    if args.no_wandb:                  w.enabled = False
+    return cfg
+
+
+# ──────────────────────────────────────────────
 # Entry point — BẮT BUỘC bọc trong __main__ vì num_workers > 0 trên Windows
 # dùng spawn, sẽ re-import module này ở mỗi worker.
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    main(Config())
+    _args = build_argparser().parse_args()
+    _cfg = apply_overrides(Config(), _args)
+    set_seed(_cfg.data.seed)
+
+    _ckpt = Path(_cfg.train.output_dir) / _cfg.train.experiment_name / _cfg.train.phase1_ckpt_name
+    print("=" * 60)
+    print(f"  exp_name   : {_cfg.train.experiment_name}")
+    print(f"  positives  : {_cfg.train.contrastive_positives}")
+    print(f"  lr / epochs: {_cfg.train.lr_phase1:.1e} / {_cfg.train.epochs_phase1}")
+    print(f"  batch / T  : {_cfg.train.batch_size_phase1} / {_cfg.train.temperature}")
+    print(f"  seed       : {_cfg.data.seed}")
+    print(f"  se ghi ra  : {_ckpt}")
+    if _ckpt.exists():
+        print(f"  CANH BAO: file nay DA TON TAI va se bi ghi de. "
+              f"Doi --exp-name neu muon giu lai.")
+    print("=" * 60)
+
+    main(_cfg)

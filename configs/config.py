@@ -96,13 +96,21 @@ class TrainConfig:
     pretrained_phase1: bool = True          # khởi tạo từ ImageNet
     # Contrastive: batch CÀNG LỚN CÀNG TỐT (negative = 4*(B-1) mỗi anchor).
     # Đo trên A40 dùng chung ~22 GB. Chạy lại find_batch_size.py nếu GPU trống hơn.
-    batch_size_phase1: int = 10              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
+    batch_size_phase1: int = 12              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
     # LR cho FULL fine-tune Swin-V2-Base (88M param, unfrozen).
     # 1e-4 quá cao ở batch này — run trước phân kỳ ở epoch 8 (loss 1.95 → 2.59
     # rồi không hồi phục). Dải an toàn cho contrastive fine-tune ViT/Swin base
     # là 2e-5 – 3e-5. Nếu tăng batch_size_phase1 thì scale LR theo căn bậc hai.
     lr_phase1: float = 2.5e-5
     temperature: float = 0.1
+    # Cách ghép positive cho contrastive loss. CLI: --positives
+    #   "patient"     : cả 4 view cùng bệnh nhân là positive (bản gốc)
+    #   "ipsilateral" : chỉ cùng bên vú (L_MLO↔L_CC, R_MLO↔R_CC);
+    #                   vú đối bên của chính bệnh nhân đó là HARD NEGATIVE
+    # "patient" kéo vú trái và phải lại gần nhau, phá thẳng tín hiệu của lớp
+    # asymmetry — đo được: backbone patient-level thua cả ImageNet ở cả 4 lớp,
+    # asymmetry AUC 0.5418 vs 0.6735. Mặc định đã đổi sang ipsilateral.
+    contrastive_positives: str = "ipsilateral"
     proj_hidden_dim: int = 2048
     proj_out_dim: int = 128
     # File checkpoint backbone mà phase 1 ghi ra và phase 2 đọc vào
@@ -119,7 +127,20 @@ class TrainConfig:
     accumulate_grad_steps: int = 1          # effective batch = 16
     lr_phase2: float = 3e-4
     # True = nạp backbone từ phase 1. Đặt False để train phase 2 từ ImageNet.
+    # CLI: --phase1 / --no-phase1
     load_phase1_backbone: bool = True
+    # Đường dẫn tường minh tới phase1_backbone.pt. "" = suy ra từ
+    # <output_dir>/<experiment_name>/<phase1_ckpt_name>. Cần đến nó khi chạy
+    # ablation với --exp-name khác, vì lúc đó output_dir đã trỏ sang chỗ khác.
+    # CLI: --phase1-ckpt
+    phase1_ckpt_path: str = ""
+
+    # Fine-tune cả backbone thay vì đóng băng. Chậm hơn nhiều (bật lại
+    # grad-checkpointing). Chỉ nên bật SAU khi head đã hội tụ, nếu không
+    # gradient rác từ head ngẫu nhiên sẽ phá luôn trọng số pretrained.
+    # CLI: --unfreeze-backbone / --backbone-lr-mult
+    unfreeze_backbone: bool = False
+    backbone_lr_multiplier: float = 0.05    # lr backbone = lr_phase2 * hệ số này
 
     # Optimizer
     weight_decay: float = 1e-2
