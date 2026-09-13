@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 # Thư mục gốc của project (nơi chứa configs/, data/, models/...).
 # Dùng cái này thay vì cwd để `python -m data.prepare_csv` chạy được
@@ -142,6 +142,29 @@ class TrainConfig:
     unfreeze_backbone: bool = False
     backbone_lr_multiplier: float = 0.05    # lr backbone = lr_phase2 * hệ số này
 
+    # Mở backbone TỪNG PHẦN. None = đóng băng hoàn toàn; 2 = chỉ train stage 3+4.
+    # Với Swin-V2-Base, stage 1+2 chỉ giữ 2.3% tham số nhưng chiếm ~60% bộ nhớ
+    # activation (stage 1 có 20.416 token → 90 window, và cosine-attention của
+    # Swin-V2 materialize hẳn ma trận attention thay vì dùng flash attention).
+    # Đóng băng chúng cũng giữ nguyên bộ dò cạnh/kết cấu của ImageNet.
+    # CLI: --unfreeze-from-stage
+    unfreeze_from_stage: Optional[int] = None
+
+    # ── SupCon phụ trợ, train CHUNG với FocalLoss (end-to-end 1 pha)
+    # 0 = tắt. Loss tổng = FocalLoss + supcon_weight * MultiLabelSupConLoss.
+    # CẢNH BÁO thang đo: FocalLoss ở đây chạy quanh 0.04 còn SupCon quanh 1-4.
+    # Đặt weight = 1.0 như các paper SupCon (họ ghép với cross-entropy ~0.5-2,
+    # cùng thang) sẽ khiến contrastive át phân loại 25-100 lần. Dải hợp lý:
+    # 0.005 - 0.02. Theo dõi cột `con_ratio` trong log, nên quanh 0.2-0.5.
+    # CLI: --supcon-weight
+    supcon_weight: float = 0.0
+    supcon_temperature: float = 0.1
+    supcon_proj_dim: int = 128
+    supcon_proj_hidden: int = 512
+    # Loại no_finding khỏi định nghĩa positive. Nếu không, lớp đa số tạo
+    # positive set khổng lồ nuốt hết tín hiệu của calcification/asymmetry.
+    supcon_exclude_no_finding: bool = True
+
     # Optimizer
     weight_decay: float = 1e-2
     # 100 step (~1/3 epoch) quá ngắn để backbone pretrained thích nghi với
@@ -193,3 +216,5 @@ class Config:
             for k, v in asdict(getattr(self, section)).items():
                 out[f"{section}.{k}"] = v
         return out
+
+

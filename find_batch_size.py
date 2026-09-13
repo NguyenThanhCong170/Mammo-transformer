@@ -60,7 +60,7 @@ def try_phase1(cfg, batch_size, device, amp_dtype):
     del backbone, head, opt, x, z, loss
 
 
-def try_phase2(cfg, batch_size, device, amp_dtype):
+def try_phase2(cfg, batch_size, device, amp_dtype, unfreeze: bool = False):
     model = MammoTransformer(
         backbone_name=cfg.model.backbone_name,
         backbone_pretrained=False,
@@ -77,12 +77,18 @@ def try_phase2(cfg, batch_size, device, amp_dtype):
         token_grid=cfg.model.token_grid,
         ffn_expansion=cfg.model.ffn_expansion,
     ).to(device)
-    model.freeze_backbone()
+    if unfreeze:
+        # Fine-tune toàn bộ: backbone có gradient + activation → tốn hơn NHIỀU.
+        # unfreeze_backbone() cũng bật lại grad-checkpointing, bắt buộc ở size này.
+        model.unfreeze_backbone()
+    else:
+        model.freeze_backbone()
     model.train()
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=3e-4)
-    scaler = torch.amp.GradScaler(device="cuda")
+    # bf16 không cần loss scaling; bật scaler thừa sẽ đo lệch.
+    scaler = torch.amp.GradScaler(device="cuda", enabled=(amp_dtype == torch.float16))
     crit = FocalLoss(cfg.train.focal_alpha, cfg.train.focal_gamma, "mean").to(device)
 
     for _ in range(2):
@@ -106,22 +112,42 @@ def main():
     ap.add_argument("--budget", type=float, default=None,
                     help="GB tối đa được phép dùng (GPU dùng chung). "
                          "Batch nào vượt ngưỡng reserved này bị coi là fail.")
+    ap.add_argument("--unfreeze", action="store_true",
+                    help="Phase 2: fine-tune CA backbone thay vi dong bang.")
+    ap.add_argument("--embed-dim", type=int, default=None,
+                    help="Ghi de cfg.model.embed_dim — phai khop lenh train that.")
+    ap.add_argument("--ffn-expansion", type=int, default=None)
+    ap.add_argument("--fp16", action="store_true",
+                    help="Ep do bang fp16. Mac dinh dung bf16 neu GPU ho tro, "
+                         "khop voi train_phase1/2.py.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("Cần GPU để chạy script này.")
 
     cfg = Config()
+    if args.embed_dim is not None:
+        cfg.model.embed_dim = args.embed_dim
+    if args.ffn_expansion is not None:
+        cfg.model.ffn_expansion = args.ffn_expansion
+
     device = torch.device("cuda")
-    amp_dtype = torch.float16
+    # Do bang dung dtype ma training thuc su dung, neu khong con so vo nghia.
+    amp_dtype = torch.float16 if (args.fp16 or not torch.cuda.is_bf16_supported()) \
+        else torch.bfloat16
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
     print(f"GPU        : {torch.cuda.get_device_name(0)} ({total_gb:.1f} GB)")
-    print(f"Phase      : {args.phase}")
+    print(f"Phase      : {args.phase}" + (" (UNFROZEN backbone)" if args.unfreeze else ""))
+    print(f"amp_dtype  : {amp_dtype}")
+    print(f"embed_dim  : {cfg.model.embed_dim} | ffn_expansion {cfg.model.ffn_expansion}")
     print(f"image_size : {cfg.model.backbone_img_size} (H, W)")
     print(f"backbone   : {cfg.model.backbone_name}\n")
 
-    runner = try_phase1 if args.phase == 1 else try_phase2
+    if args.phase == 1:
+        runner = try_phase1
+    else:
+        runner = lambda c, bs, dev, dt: try_phase2(c, bs, dev, dt, unfreeze=args.unfreeze)
 
     # Phase 1 dùng contrastive loss → cần ít nhất 2 bệnh nhân mới có negative,
     # MultiViewNTXentLoss raise ValueError nếu batch_size < 2.

@@ -62,11 +62,82 @@ class SwinV2Backbone(nn.Module):
         self.num_features = self.out_dim
         self.set_grad_checkpointing(grad_checkpointing)
 
-    def set_grad_checkpointing(self, enable: bool = True):
+    # ── Truy cập danh sách stage của timm Swin (tên thuộc tính đổi theo version)
+    def _stages(self):
+        for attr in ("layers", "layers_", "stages"):
+            mods = getattr(self.backbone, attr, None)
+            if mods is not None and len(mods) > 0:
+                return list(mods)
+        raise RuntimeError(
+            "Không tìm thấy danh sách stage của backbone. Các con trực tiếp: "
+            f"{[n for n, _ in self.backbone.named_children()]}"
+        )
+
+    @property
+    def num_stages(self) -> int:
+        return len(self._stages())
+
+    def set_grad_checkpointing(self, enable: bool = True, only_trainable: bool = True):
+        """
+        Bật grad-checkpointing. Với only_trainable=True chỉ bật ở những stage
+        thực sự có gradient — checkpoint một đoạn không cần grad vừa vô ích vừa
+        làm PyTorch cảnh báo "None of the inputs have requires_grad=True".
+        """
         try:
             self.backbone.set_grad_checkpointing(enable)
         except Exception:
             pass
+        if not (enable and only_trainable):
+            return
+        try:
+            for stage in self._stages():
+                trainable = any(p.requires_grad for p in stage.parameters())
+                if hasattr(stage, "grad_checkpointing"):
+                    stage.grad_checkpointing = bool(trainable)
+        except Exception:
+            pass
+
+    def freeze_stages(self, unfreeze_from: Optional[int]):
+        """
+        Đóng băng patch_embed và các stage < unfreeze_from; mở phần còn lại.
+
+        unfreeze_from = None → đóng băng TOÀN BỘ backbone
+        unfreeze_from = 0    → mở toàn bộ (tương đương unfreeze())
+        unfreeze_from = 2    → chỉ train stage 3 và 4 (đánh số từ 0)
+
+        Vì sao mặc định nên là 2 với Swin-V2-Base: stage 1+2 chỉ giữ ~2.3%
+        tham số nhưng chiếm phần lớn bộ nhớ activation (stage 1 có 20.416
+        token → 90 window, và cosine-attention của Swin-V2 materialize hẳn
+        ma trận attention). Đóng băng chúng cắt ~60% VRAM mà gần như không
+        mất năng lực biểu diễn — và giữ nguyên bộ dò cạnh/kết cấu của ImageNet,
+        thứ ít cần thích nghi miền nhất.
+        """
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        if unfreeze_from is None:
+            self.set_grad_checkpointing(False)
+            return 0
+
+        stages = self._stages()
+        if not (0 <= unfreeze_from <= len(stages)):
+            raise ValueError(
+                f"unfreeze_from phải trong [0, {len(stages)}], nhận {unfreeze_from}."
+            )
+
+        for stage in stages[unfreeze_from:]:
+            for p in stage.parameters():
+                p.requires_grad = True
+        # norm cuối luôn đi cùng phần được train
+        for name in ("norm", "head"):
+            mod = getattr(self.backbone, name, None)
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = True
+
+        n_train = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        self.set_grad_checkpointing(True)
+        return n_train
 
     # ── (B, 3, H, W) → (B, D)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -348,11 +419,24 @@ class MammoTransformer(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def forward(self, images: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, images: Dict[str, torch.Tensor], return_features: bool = False):
+        """
+        return_features=False → logits (B, num_classes)
+        return_features=True  → (logits, view_feats, global_feat)
+            view_feats  : (B, V, D_bb) — đặc trưng backbone từng view, đã
+                          mean-pool trên token. Dùng cho SupCon mức view.
+            global_feat : (B, D)       — vector sau bilateral fusion, ngay
+                          trước classifier. Dùng cho SupCon mức bệnh nhân.
+        """
         # Step 1: token features từng view qua shared backbone
         feats = {}
+        view_pooled = []
         for key in VIEW_KEYS:
             t = self.backbone.forward_tokens(images[key])   # (B, N, D_bb)
+            if return_features:
+                # Mean-pool trên token → 1 vector/view. KHÔNG detach: mục đích
+                # của SupCon là để gradient chảy ngược vào backbone.
+                view_pooled.append(t.mean(dim=1))           # (B, D_bb)
             feats[key] = self.input_proj(t)                 # (B, N, D)
 
         # Step 2: view + positional embedding
@@ -366,7 +450,11 @@ class MammoTransformer(nn.Module):
         global_feat = self.bilateral_fusion(left=left, right=right)
 
         # Step 5: classify
-        return self.classifier(global_feat)                 # (B, num_classes)
+        logits = self.classifier(global_feat)               # (B, num_classes)
+
+        if return_features:
+            return logits, torch.stack(view_pooled, dim=1), global_feat
+        return logits
 
     # ── Backbone control ──
     def freeze_backbone(self):
@@ -377,7 +465,19 @@ class MammoTransformer(nn.Module):
     def unfreeze_backbone(self):
         self.backbone.unfreeze()
         self.backbone.set_grad_checkpointing(True)
-        print("[Model] Backbone unfrozen.")
+        print("[Model] Backbone unfrozen (toan bo).")
+
+    def unfreeze_backbone_from_stage(self, stage: Optional[int]):
+        """Chỉ mở các stage >= `stage`. None = đóng băng toàn bộ backbone."""
+        n_train = self.backbone.freeze_stages(stage)
+        n_total = sum(p.numel() for p in self.backbone.parameters())
+        if stage is None:
+            print("[Model] Backbone FROZEN hoan toan (grad-checkpointing off).")
+        else:
+            print(f"[Model] Backbone mo tu stage {stage + 1}/{self.backbone.num_stages} "
+                  f"(danh so tu 1) — trainable {n_train:,}/{n_total:,} "
+                  f"({100 * n_train / max(1, n_total):.1f}%), grad-checkpointing on.")
+        return n_train
 
     def load_backbone_weights(self, ckpt_path: str, device="cpu") -> None:
         """Nạp backbone đã contrastive-pretrain ở phase 1."""

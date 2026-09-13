@@ -60,23 +60,35 @@ class MammoDataset(Dataset):
         self.patients: List[str] = self.df["patient_id"].unique().tolist()
         self.patient_views: Dict[str, Dict[str, pd.Series]] = {}
         self.patient_labels: Dict[str, torch.Tensor] = {}
+        # Nhãn theo TỪNG ẢNH, không gộp. Nhãn gộp bệnh nhân gán "mass" cho cả
+        # vú phải khoẻ mạnh khi vú trái có u — nhiễu nặng nếu dùng cho
+        # contrastive mức view. Nhãn per-image vốn đã có sẵn trong CSV.
+        self.patient_view_labels: Dict[str, Dict[str, torch.Tensor]] = {}
 
         for pid, group in self.df.groupby("patient_id"):
             view_map = {}
+            view_label_map = {}
             label_vec = torch.zeros(self.num_classes, dtype=torch.float32)
 
             for _, row in group.iterrows():
                 lat = str(row["laterality"]).strip().upper()      # L / R
                 view = str(row["view_position"]).strip().upper()  # MLO / CC
-                view_map[f"{lat}_{view}"] = row
+                key = f"{lat}_{view}"
+                view_map[key] = row
 
                 target = row["target"]
                 if isinstance(target, str):
                     target = ast.literal_eval(target)
                 if isinstance(target, (int, np.integer)):
                     target = [int(target)]
+
+                one = torch.zeros(self.num_classes, dtype=torch.float32)
                 for cls_idx in target:
                     label_vec[int(cls_idx)] = 1.0
+                    one[int(cls_idx)] = 1.0
+                if one[1:].sum() > 0:
+                    one[0] = 0.0
+                view_label_map[key] = one
 
             # Nếu có bất kỳ finding nào → không còn là "no finding"
             if label_vec[1:].sum() > 0:
@@ -84,6 +96,7 @@ class MammoDataset(Dataset):
 
             self.patient_views[pid] = view_map
             self.patient_labels[pid] = label_vec
+            self.patient_view_labels[pid] = view_label_map
 
     def __len__(self) -> int:
         return len(self.patients)
@@ -93,19 +106,26 @@ class MammoDataset(Dataset):
         view_map = self.patient_views[pid]
 
         images = {}
+        view_label_map = self.patient_view_labels[pid]
+        view_labels = []
         for key in VIEW_KEYS:
             if key in view_map:
                 images[key] = self._load_image(view_map[key]["image_path"])
+                view_labels.append(view_label_map[key].clone().detach())
             else:
                 self._missing_view_count += 1
                 if self.verbose_missing:
                     print(f"[Dataset] Thiếu view {key} ở bệnh nhân {pid} → dùng ảnh đen.")
                 images[key] = self._empty_image()
+                # Ảnh đen: nhãn toàn 0 = "không biết". Sau khi loại no_finding
+                # khỏi positive set thì nó tự động không ghép cặp với ai.
+                view_labels.append(torch.zeros(self.num_classes, dtype=torch.float32))
 
         return {
             "images": images,
             # label đã là Tensor → clone().detach(), KHÔNG dùng torch.tensor(tensor)
             "label": self.patient_labels[pid].clone().detach(),
+            "view_labels": torch.stack(view_labels),        # (V, num_classes)
             "patient_id": pid,
         }
 
@@ -166,7 +186,10 @@ def mammo_collate_fn(batch):
     images = {k: torch.stack([item["images"][k] for item in batch]) for k in VIEW_KEYS}
     labels = torch.stack([item["label"] for item in batch])
     patient_ids = [item["patient_id"] for item in batch]
-    return {"images": images, "label": labels, "patient_id": patient_ids}
+    # Khoá mới, thêm vào không phá code cũ: train_phase1.py bỏ qua nó.
+    view_labels = torch.stack([item["view_labels"] for item in batch])   # (B, V, C)
+    return {"images": images, "label": labels,
+            "view_labels": view_labels, "patient_id": patient_ids}
 
 
 # ──────────────────────────────────────────────

@@ -27,9 +27,19 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from configs.config import Config
-from data.dataset import build_dataloaders
-from models.mammo_transformer import MammoTransformer
+from data.dataset import build_dataloaders, VIEW_KEYS as DATA_VIEW_KEYS
+from models.mammo_transformer import MammoTransformer, VIEW_KEYS as MODEL_VIEW_KEYS
+from models.projection_head import ProjectionHead
+
+# VIEW_KEYS bị khai báo trùng ở hai file. SupCon ghép z[i] với view_labels[i]
+# theo đúng thứ tự này, nên nếu hai bản lệch nhau thì nhãn sẽ gán sai ảnh —
+# một lỗi câm, không crash, chỉ làm kết quả sai. Chặn ngay lúc import.
+assert list(DATA_VIEW_KEYS) == list(MODEL_VIEW_KEYS), (
+    f"VIEW_KEYS lech nhau!\n  data/dataset.py        : {list(DATA_VIEW_KEYS)}\n"
+    f"  models/mammo_transformer.py: {list(MODEL_VIEW_KEYS)}"
+)
 from utils.losses import FocalLoss, MultiLabelMetricsCalculator
+from utils.Supcon_loss import MultiLabelSupConLoss
 from utils.wandb_utils import WandbLogger, flatten_metrics
 
 CLASS_NAMES = ["no_finding", "mass", "calcification", "asymmetry"]
@@ -97,12 +107,17 @@ class CheckpointManager:
 def train_one_epoch(
     model, loader, optimizer, scheduler, criterion, scaler,
     device, cfg, epoch, logger, global_step, amp_dtype, use_amp, trainable_params,
+    supcon=None, proj_head=None,
 ):
     model.train()          # override trong MammoTransformer giữ backbone ở eval nếu frozen
+    if proj_head is not None:
+        proj_head.train()
     total_loss = 0.0
+    sum_cls, sum_con, n_con = 0.0, 0.0, 0
     accumulate_steps = cfg.train.accumulate_grad_steps
     n_skipped, n_nonfinite = 0, 0
     grad_norm = torch.tensor(0.0)
+    use_supcon = supcon is not None and cfg.train.supcon_weight > 0
 
     metrics_calc = MultiLabelMetricsCalculator(
         num_classes=cfg.data.num_classes,
@@ -119,9 +134,26 @@ def train_one_epoch(
         # FocalLoss có log/exp và sigmoid — dưới fp16 rất dễ mất chính xác ở
         # đuôi phân phối, mà focal loss thì sống bằng đúng cái đuôi đó.
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(images)
+            if use_supcon:
+                logits, view_feats, _ = model(images, return_features=True)
+                z = proj_head(view_feats.reshape(-1, view_feats.shape[-1]))
+            else:
+                logits = model(images)
+
         with autocast(device_type=device.type, enabled=False):
-            loss = criterion(logits.float(), labels) / accumulate_steps
+            loss_cls = criterion(logits.float(), labels)
+            if use_supcon:
+                # Nhãn theo TỪNG ẢNH, không phải nhãn gộp bệnh nhân — nếu dùng
+                # nhãn gộp thì vú phải khoẻ mạnh cũng bị gán "mass".
+                vl = batch["view_labels"].to(device, non_blocking=True)
+                loss_con = supcon(z.float(), vl.reshape(-1, vl.shape[-1]).float())
+                loss = loss_cls + cfg.train.supcon_weight * loss_con
+                sum_con += float(loss_con.detach()); n_con += 1
+            else:
+                loss_con = None
+                loss = loss_cls
+            sum_cls += float(loss_cls.detach())
+            loss = loss / accumulate_steps
 
         if not torch.isfinite(loss):
             n_nonfinite += 1
@@ -157,18 +189,34 @@ def train_one_epoch(
         if (step + 1) % cfg.train.log_every_n_steps == 0:
             lr_now = optimizer.param_groups[0]["lr"]
             gn = float(grad_norm)
-            print(f"  [P2] Epoch {epoch} | Step {step+1}/{len(loader)} | "
-                  f"loss {batch_loss:.4f} | avg {total_loss/(step+1):.4f} | "
-                  f"lr {lr_now:.2e} | grad_norm {gn:.2f}")
-            logger.log({
+            extra = ""
+            payload = {
                 "train/step_loss": batch_loss,
                 "train/lr": lr_now,
                 "train/grad_norm": gn if math.isfinite(gn) else -1.0,
                 "train/amp_scale": scaler.get_scale(),
-            }, step=global_step)
+            }
+            if use_supcon and loss_con is not None:
+                lc, lo = float(loss_cls.detach()), float(loss_con.detach())
+                w = cfg.train.supcon_weight
+                # In cả tỉ lệ đóng góp — đây là con số dùng để chỉnh
+                # --supcon-weight. Nên nằm quanh 0.2–0.5.
+                extra = f" | cls {lc:.4f} | con {lo:.3f} (x{w:g} = {w*lo:.4f}, {w*lo/max(lc,1e-9):.2f}x cls)"
+                payload.update({
+                    "train/step_loss_cls": lc,
+                    "train/step_loss_con": lo,
+                    "train/step_con_ratio": w * lo / max(lc, 1e-9),
+                })
+            print(f"  [P2] Epoch {epoch} | Step {step+1}/{len(loader)} | "
+                  f"loss {batch_loss:.4f} | avg {total_loss/(step+1):.4f} | "
+                  f"lr {lr_now:.2e} | grad_norm {gn:.2f}{extra}")
+            logger.log(payload, step=global_step)
 
     metrics = metrics_calc.compute()
     metrics["loss"] = total_loss / max(1, len(loader))
+    metrics["loss_cls"] = sum_cls / max(1, len(loader))
+    if n_con:
+        metrics["loss_con"] = sum_con / n_con
     metrics["time"] = time.time() - t0
     metrics["amp_skipped"] = n_skipped
     metrics["amp_nonfinite"] = n_nonfinite
@@ -214,20 +262,28 @@ def validate(model, loader, criterion, device, cfg, amp_dtype, use_amp,
 # ──────────────────────────────────────────────
 # Optimizer + Scheduler (chỉ train non-backbone)
 # ──────────────────────────────────────────────
-def build_optimizer_scheduler(model, lr: float, cfg: Config, total_optim_steps: int):
-    if cfg.train.unfreeze_backbone:
+def build_optimizer_scheduler(model, lr: float, cfg: Config, total_optim_steps: int,
+                              extra_module=None):
+    backbone_trainable = any(p.requires_grad for p in model.backbone.parameters())
+    if backbone_trainable:
         # LR phân tầng: backbone (đã pretrain) đi chậm hơn head (ngẫu nhiên).
         # get_param_groups() đã có sẵn trong mammo_transformer.py nhưng trước
         # đây không ai gọi — hàm này lọc bỏ hẳn param backbone.
         groups = model.get_param_groups(
             lr, backbone_lr_multiplier=cfg.train.backbone_lr_multiplier)
+        # ProjectionHead của SupCon đi cùng LR với head (nó cũng khởi tạo ngẫu nhiên)
+        if extra_module is not None:
+            groups[0]["params"] = list(groups[0]["params"]) + list(extra_module.parameters())
         optimizer = AdamW(groups, weight_decay=cfg.train.weight_decay)
         n_g = [(len(g["params"]), g["lr"]) for g in groups]
         print(f"[Optim] Param groups: " + " | ".join(f"{n} tensor @ lr {l:.1e}" for n, l in n_g))
     else:
         params = [p for n, p in model.named_parameters()
                   if not n.startswith("backbone") and p.requires_grad]
+        if extra_module is not None:
+            params += [p for p in extra_module.parameters() if p.requires_grad]
         optimizer = AdamW(params, lr=lr, weight_decay=cfg.train.weight_decay)
+        print(f"[Optim] Backbone dong bang — train {len(params)} tensor @ lr {lr:.1e}")
 
     effective_warmup = max(1, min(cfg.train.warmup_steps, total_optim_steps // 2))
     warmup = LinearLR(optimizer, start_factor=0.1, total_iters=effective_warmup)
@@ -321,11 +377,19 @@ def train(cfg: Config):
     model.to(device)
 
     # ── Freeze / unfreeze backbone
+    # Ba chế độ, ưu tiên --unfreeze-from-stage nếu được đặt:
+    #   None (mặc định)        → backbone đóng băng hoàn toàn
+    #   --unfreeze-from-stage 2 → chỉ train stage 3+4 (khuyến nghị)
+    #   --unfreeze-backbone     → mở toàn bộ (tương đương stage 0)
     print("\n" + "=" * 60)
-    if cfg.train.unfreeze_backbone:
-        print(f"  Backbone init: {backbone_init}  |  UNFROZEN (fine-tune toan bo)")
+    stage = cfg.train.unfreeze_from_stage
+    if stage is None and cfg.train.unfreeze_backbone:
+        stage = 0
+    if stage is not None:
+        label = "TOAN BO" if stage == 0 else f"tu stage {stage + 1}"
+        print(f"  Backbone init: {backbone_init}  |  FINE-TUNE {label}")
         print("=" * 60)
-        model.unfreeze_backbone()          # bật lại grad-checkpointing
+        model.unfreeze_backbone_from_stage(stage)
     else:
         print(f"  Backbone init: {backbone_init}  |  FROZEN")
         print("  Train cross-attention + classifier")
@@ -345,12 +409,37 @@ def train(cfg: Config):
         reduction=cfg.train.focal_reduction,
     ).to(device)
 
+    # ── SupCon (tuỳ chọn). supcon_weight = 0 → tắt hoàn toàn, không tạo head.
+    supcon, proj_head = None, None
+    if cfg.train.supcon_weight > 0:
+        supcon = MultiLabelSupConLoss(
+            temperature=cfg.train.supcon_temperature,
+            exclude_classes=(0,) if cfg.train.supcon_exclude_no_finding else (),
+        ).to(device)
+        proj_head = ProjectionHead(
+            input_dim=model.backbone.out_dim,
+            hidden_dim=cfg.train.supcon_proj_hidden,
+            out_dim=cfg.train.supcon_proj_dim,
+        ).to(device)
+        n_anchor = cfg.train.batch_size * 4
+        print(f"[Phase 2] SupCon: BAT | weight {cfg.train.supcon_weight:g} "
+              f"| T {cfg.train.supcon_temperature} "
+              f"| loai no_finding khoi positive: {cfg.train.supcon_exclude_no_finding} "
+              f"| {n_anchor} anchor/batch")
+        print(f"[Phase 2] CHINH --supcon-weight theo cot 'con_ratio' trong log: "
+              f"nen quanh 0.2-0.5. FocalLoss ~0.04 con SupCon ~1-4 nen weight "
+              f"hop ly thuong la 0.005-0.02, KHONG phai 1.0.")
+    else:
+        print("[Phase 2] SupCon: TAT (--supcon-weight 0) — chi FocalLoss.")
+
     steps_per_epoch = max(1, len(train_loader) // cfg.train.accumulate_grad_steps)
     total_optim_steps = steps_per_epoch * cfg.train.epochs_phase2
     optimizer, scheduler = build_optimizer_scheduler(
-        model, cfg.train.lr_phase2, cfg, total_optim_steps)
+        model, cfg.train.lr_phase2, cfg, total_optim_steps, extra_module=proj_head)
     scaler = GradScaler(device=device.type, enabled=scaler_enabled, init_scale=1024.0)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if proj_head is not None:
+        trainable_params += [p for p in proj_head.parameters() if p.requires_grad]
     print(f"[Phase 2] GradScaler: {'BAT (fp16)' if scaler_enabled else 'TAT (khong can voi bf16/fp32)'}")
     print(f"[Phase 2] LR: {cfg.train.lr_phase2:.1e} | warmup: {cfg.train.warmup_steps} step "
           f"| total: {total_optim_steps} optim-step ({steps_per_epoch} step/epoch)")
@@ -371,6 +460,7 @@ def train(cfg: Config):
         train_metrics, global_step = train_one_epoch(
             model, train_loader, optimizer, scheduler, criterion, scaler,
             device, cfg, epoch, logger, global_step, amp_dtype, use_amp, trainable_params,
+            supcon=supcon, proj_head=proj_head,
         )
         val_metrics = validate(model, val_loader, criterion, device, cfg,
                                amp_dtype, use_amp, split="Val")
@@ -476,8 +566,13 @@ neu khong thi chenh lech macro-AP la nhieu chu khong phai hieu ung phase 1.
   python train_phase2.py --exp-name abl_imagenet --no-phase1 \\
       --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --grad-clip 0.5 --epochs 30
 
-  # Fine-tune ca backbone (chay SAU khi head da hoi tu)
-  python train_phase2.py --exp-name ft --unfreeze-backbone --backbone-lr-mult 0.05
+Hai model de so sanh (fine-tune stage 3+4, ImageNet init):
+
+  # M1 — ImageNet thuan, chi FocalLoss
+  python train_phase2.py --exp-name ft_pure --no-phase1 --unfreeze-from-stage 2 --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --backbone-lr-mult 0.05 --grad-clip 0.5 --epochs 30 --seed 42
+
+  # M2 — nhu tren, cong them SupCon
+  python train_phase2.py --exp-name ft_supcon --no-phase1 --unfreeze-from-stage 2 --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --backbone-lr-mult 0.05 --grad-clip 0.5 --epochs 30 --seed 42 --supcon-weight 0.01
 """)
 
     g = p.add_mutually_exclusive_group()
@@ -510,9 +605,22 @@ neu khong thi chenh lech macro-AP la nhieu chu khong phai hieu ung phase 1.
                    help='Vi du "8,4" hoac "16,6". "none" = giu nguyen 319 token.')
 
     p.add_argument("--unfreeze-backbone", action="store_true", default=None,
-                   help="Fine-tune ca backbone (cham hon nhieu, bat grad-checkpointing).")
+                   help="Fine-tune TOAN BO backbone (= --unfreeze-from-stage 0).")
+    p.add_argument("--unfreeze-from-stage", type=int, default=None, metavar="N",
+                   help="Chi mo backbone tu stage N (danh so tu 0). "
+                        "2 = train stage 3+4 — KHUYEN NGHI: ~9GB VRAM thay vi ~17GB, "
+                        "va stage 1+2 chi giu 2.3%% tham so.")
     p.add_argument("--backbone-lr-mult", type=float, default=None,
                    help="LR cua backbone = lr * he so nay. Mac dinh 0.05.")
+
+    p.add_argument("--supcon-weight", type=float, default=None, metavar="W",
+                   help="Cong them W * MultiLabelSupConLoss vao FocalLoss. "
+                        "0 = tat (chi FocalLoss). Dai hop ly 0.005-0.02 — "
+                        "KHONG phai 1.0, vi FocalLoss o day chi ~0.04.")
+    p.add_argument("--supcon-temperature", type=float, default=None)
+    p.add_argument("--supcon-proj-dim", type=int, default=None)
+    p.add_argument("--supcon-keep-no-finding", action="store_true",
+                   help="Giu no_finding trong positive set (mac dinh loai bo).")
 
     p.add_argument("--no-wandb", action="store_true", help="Tat wandb logging.")
     return p
@@ -543,8 +651,14 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         m.token_grid = None if tg in ("none", "null", "") else \
             tuple(int(x) for x in tg.replace("x", ",").split(","))
 
-    if args.unfreeze_backbone is not None:  t.unfreeze_backbone = args.unfreeze_backbone
-    if args.backbone_lr_mult is not None:   t.backbone_lr_multiplier = args.backbone_lr_mult
+    if args.unfreeze_backbone is not None:   t.unfreeze_backbone = args.unfreeze_backbone
+    if args.unfreeze_from_stage is not None: t.unfreeze_from_stage = args.unfreeze_from_stage
+    if args.backbone_lr_mult is not None:    t.backbone_lr_multiplier = args.backbone_lr_mult
+
+    if args.supcon_weight is not None:       t.supcon_weight = args.supcon_weight
+    if args.supcon_temperature is not None:  t.supcon_temperature = args.supcon_temperature
+    if args.supcon_proj_dim is not None:     t.supcon_proj_dim = args.supcon_proj_dim
+    if args.supcon_keep_no_finding:          t.supcon_exclude_no_finding = False
     if args.no_wandb:                       w.enabled = False
 
     return cfg
@@ -561,7 +675,13 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"  exp_name        : {cfg.train.experiment_name}")
     print(f"  backbone init   : {'phase1' if cfg.train.load_phase1_backbone else 'ImageNet'}")
-    print(f"  backbone        : {'UNFROZEN' if cfg.train.unfreeze_backbone else 'frozen'}")
+    _st = cfg.train.unfreeze_from_stage
+    if _st is None and cfg.train.unfreeze_backbone:
+        _st = 0
+    print(f"  backbone        : " + ("frozen" if _st is None else
+          ("fine-tune TOAN BO" if _st == 0 else f"fine-tune tu stage {_st + 1}")))
+    print(f"  supcon          : " + ("TAT" if cfg.train.supcon_weight <= 0 else
+          f"weight {cfg.train.supcon_weight:g}, T {cfg.train.supcon_temperature}"))
     print(f"  embed_dim       : {cfg.model.embed_dim} | ffn_exp {cfg.model.ffn_expansion} "
           f"| ipsi {cfg.model.num_ipsi_layers} | bila {cfg.model.num_bilateral_layers}")
     print(f"  token_grid      : {cfg.model.token_grid}")

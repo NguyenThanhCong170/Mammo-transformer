@@ -153,3 +153,100 @@ def build_view_groups(view_keys: Sequence[str], mode: str) -> Optional[list]:
             f"ipsilateral-only se giong het patient-level."
         )
     return [uniq.index(l) for l in lats]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SupCon cho MULTI-LABEL — dùng ở train_phase2.py (train chung với FocalLoss)
+# ══════════════════════════════════════════════════════════════════════════
+class MultiLabelSupConLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020) mở rộng cho
+    multi-label, theo biến thể "any-shared-label có trọng số Jaccard".
+
+    Khác hẳn MultiViewNTXentLoss ở trên:
+      - positive = cùng NHÃN BỆNH, bất kể bệnh nhân nào
+      - dùng trong end-to-end một pha, cộng vào FocalLoss
+
+    Đây là điểm sửa cốt lõi so với pretrain 2 pha: pretext task cũ lấy patient
+    ID làm nhãn nên chỉ dạy "nhận diện bệnh nhân". Ở chế độ end-to-end ta đã
+    có nhãn thật, dùng patient ID là tự vứt bỏ thông tin.
+
+    ── Trọng số positive ─────────────────────────────────────────────────
+    w_ij = |y_i ∩ y_j| / |y_i ∪ y_j|   (Jaccard)
+    Hai mẫu không chung nhãn nào → w = 0 (là negative).
+    Trùng nhãn hoàn toàn → w = 1.
+
+    ── exclude_classes ───────────────────────────────────────────────────
+    Mặc định loại lớp 0 (`no_finding`) khỏi phép tính overlap. Nếu không,
+    lớp đa số sẽ tạo một positive set khổng lồ nuốt hết tín hiệu của
+    calcification/asymmetry — vốn chỉ có vài mẫu mỗi batch.
+    Mẫu chỉ mang nhãn no_finding sẽ không có positive nào; chúng vẫn đóng
+    vai trò negative, còn bản thân anchor đó bị bỏ qua khi lấy trung bình.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        exclude_classes: Optional[Sequence[int]] = (0,),
+        base_temperature: Optional[float] = None,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        # Khosla et al. chia thêm cho base_temperature để độ lớn gradient không
+        # đổi khi chỉnh temperature. Mặc định = temperature (tức hệ số 1).
+        self.base_temperature = base_temperature or temperature
+        self.exclude_classes = tuple(exclude_classes) if exclude_classes else ()
+
+    def extra_repr(self) -> str:
+        return (f"temperature={self.temperature}, "
+                f"exclude_classes={self.exclude_classes}")
+
+    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        features: (N, D) — chưa cần chuẩn hoá, hàm tự normalize.
+        labels  : (N, C) multi-hot float/bool.
+        Trả về scalar. Batch không có cặp positive nào → trả 0 (có grad).
+        """
+        if features.ndim != 2:
+            raise ValueError(f"features phải là (N, D), nhận {tuple(features.shape)}")
+        if labels.shape[0] != features.shape[0]:
+            raise ValueError(
+                f"Số mẫu lệch: features {features.shape[0]} vs labels {labels.shape[0]}")
+
+        device = features.device
+        N = features.shape[0]
+
+        y = labels.float().clone()
+        for c in self.exclude_classes:
+            if 0 <= c < y.shape[1]:
+                y[:, c] = 0.0
+
+        # Jaccard: |giao| / |hợp|,  |hợp| = |y_i| + |y_j| - |giao|
+        inter = y @ y.T                                     # (N, N)
+        card = y.sum(1, keepdim=True)                       # (N, 1)
+        union = card + card.T - inter
+        w = torch.where(union > 0, inter / union.clamp(min=1e-12),
+                        torch.zeros_like(inter))
+
+        eye = torch.eye(N, device=device)
+        w = w * (1.0 - eye)                                 # bỏ chính nó
+
+        z = F.normalize(features.float(), dim=1)
+        sim = (z @ z.T) / self.temperature
+
+        # log-softmax trên mọi cột trừ đường chéo
+        sim_masked = sim - eye * 1e9
+        logits = sim - sim_masked.max(dim=1, keepdim=True)[0].detach()
+        exp_logits = torch.exp(logits) * (1.0 - eye)
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+        w_sum = w.sum(1)                                    # (N,)
+        valid = w_sum > 0                                   # anchor có positive
+        if not valid.any():
+            # Không cặp nào chung nhãn — trả 0 nhưng vẫn nối vào graph để
+            # optimizer không vấp "grad is None" ở các step như vậy.
+            return (features.float() * 0.0).sum()
+
+        mean_log_prob_pos = (w * log_prob).sum(1)[valid] / w_sum[valid]
+        loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
+        return loss.mean()
