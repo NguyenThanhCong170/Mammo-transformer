@@ -105,12 +105,6 @@ class SwinV2Backbone(nn.Module):
         unfreeze_from = 0    → mở toàn bộ (tương đương unfreeze())
         unfreeze_from = 2    → chỉ train stage 3 và 4 (đánh số từ 0)
 
-        Vì sao mặc định nên là 2 với Swin-V2-Base: stage 1+2 chỉ giữ ~2.3%
-        tham số nhưng chiếm phần lớn bộ nhớ activation (stage 1 có 20.416
-        token → 90 window, và cosine-attention của Swin-V2 materialize hẳn
-        ma trận attention). Đóng băng chúng cắt ~60% VRAM mà gần như không
-        mất năng lực biểu diễn — và giữ nguyên bộ dò cạnh/kết cấu của ImageNet,
-        thứ ít cần thích nghi miền nhất.
         """
         for p in self.backbone.parameters():
             p.requires_grad = False
@@ -375,7 +369,7 @@ class MammoTransformer(nn.Module):
         num_bilateral_layers: int,
         mlp_hidden_dim: int,
         mlp_dropout: float,
-        num_classes: int = 4,
+        num_classes: int = 3,
         token_grid: Optional[Tuple[int, int]] = (8, 4),
         ffn_expansion: int = 4,
     ):

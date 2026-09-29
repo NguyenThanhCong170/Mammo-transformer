@@ -11,11 +11,6 @@ Resize toàn bộ ảnh PNG sang kích thước mới, giữ nguyên cấu trúc
     python data/resize_images.py --src D:/data/images_cropped --dst D:/data/images_928x352 \
                                  --csv labels.csv --workers 12
 
-Đặc điểm:
-  - Resume được: file đã tồn tại đúng size ở đích sẽ bị bỏ qua (--force để ép làm lại).
-  - Đa tiến trình (mặc định = số CPU core).
-  - Chuyển RGB → L (ảnh mammo là ảnh xám, lưu 3 kênh phí 3x dung lượng).
-  - Sinh CSV mới với image_path đã trỏ sang thư mục đích.
 """
 
 import argparse
@@ -28,8 +23,8 @@ from pathlib import Path
 from PIL import Image
 
 RESAMPLE = {
-    "lanczos": Image.LANCZOS,   # sắc nét nhất, giữ đốm sáng nhỏ tốt hơn (mặc định)
-    "box": Image.BOX,           # trung bình vùng, không ringing, mượt hơn
+    "lanczos": Image.LANCZOS,   
+    "box": Image.BOX,          
     "bilinear": Image.BILINEAR,
     "bicubic": Image.BICUBIC,
 }

@@ -125,7 +125,7 @@ def test_contrastive(cfg, device):
 def test_metrics(cfg):
     calc = MultiLabelMetricsCalculator(
         num_classes=cfg.data.num_classes,
-        class_names=["no_finding", "mass", "calcification", "asymmetry"])
+        class_names=["no_finding", "mass", "calcification"])
     for _ in range(5):
         calc.update(torch.randn(8, cfg.data.num_classes),
                     torch.randint(0, 2, (8, cfg.data.num_classes)).float())

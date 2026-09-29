@@ -154,7 +154,7 @@ class MultiLabelMetricsCalculator:
         metric_keys = ["auc", "ap", "accuracy", "sensitivity", "specificity", "ppv", "npv", "f1"]
         for key in metric_keys:
             macro[f"macro_{key}"] = round(
-                float(np.mean([per_class[name][key] for name in self.class_names])), 4
+                float(np.mean([per_class[name][key] for name in self.class_names])), 3
             )
  
         return {"per_class": per_class, "macro": macro}

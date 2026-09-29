@@ -2,14 +2,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-# Thư mục gốc của project (nơi chứa configs/, data/, models/...).
-# Dùng cái này thay vì cwd để `python -m data.prepare_csv` chạy được
-# từ bất kỳ thư mục nào, không phụ thuộc bạn đang đứng ở đâu.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def resolve_path(p: Union[str, Path]) -> Path:
-    """Đường dẫn tương đối → tính từ PROJECT_ROOT. Tuyệt đối → giữ nguyên."""
     p = Path(p)
     return p if p.is_absolute() else (PROJECT_ROOT / p)
 
@@ -19,41 +15,32 @@ class DataConfig:
     # ── PIPELINE: crop DICOM → raw_images_dir
     #              → prepare_csv.py  → csv_raw
     #              → resize_images.py → data_root + csv_path
-    #
-    # raw_images_dir : ảnh gốc sau crop, ĐẦU VÀO của prepare_csv.py
-    # data_root      : ảnh dùng để TRAIN (sau resize). Hai cái có thể khác nhau!
-    raw_images_dir: str = "images_cropped"      # prepare_csv.py quét thư mục này
-    data_root: str = "images_928x352"           # training đọc thư mục này
+    
+    raw_images_dir: str = "images_cropped"      # image after crop dicom
+    data_root: str = "images_928x352"           # image after resize
 
-    raw_annotations_csv: str = "finding_annotations.csv"   # file gốc VinDr
-    csv_raw: str = "labels.csv"                 # prepare_csv.py ghi ra file này
-    csv_path: str = "labels_352x928.csv"        # resize_images.py ghi ra, training đọc
+    raw_annotations_csv: str = "finding_annotations.csv"   
+    csv_raw: str = "labels.csv"                 # csv of image after crop dicom
+    csv_path: str = "labels_352x928.csv"        # csv of image after resize
     image_ext: str = ".png"
 
-    # QUY ƯỚC TOÀN DỰ ÁN: image_size LUÔN là (H, W) — giống PyTorch/timm.
-    # Gốc 1856x704 → resize 0.5x → 928x352 (giữ nguyên tỉ lệ 2.6364).
     image_size: Tuple[int, int] = (928, 352)
 
-    # Trên Windows nên để 0 hoặc 2. num_workers>0 cần code bọc trong main().
     num_workers: int = 4
     persistent_workers: bool = True
 
-    # Split — VinDr-Mammo đã có sẵn cột 'split' (training/test)
     val_ratio: float = 0.15
     seed: int = 42
 
     # Augmentation
     aug_level: int = 3                 # MedAugment level ∈ {1,2,3,4,5}
 
-    num_classes: int = 4
+    num_classes: int = 3
 
     label_mapping: dict = field(default_factory=lambda: {
         "no finding": 0,
         "Mass": 1,
         "Suspicious Calcification": 2,
-        "Asymmetry": 3,
-        "Global Asymmetry": 3,
-        "Focal Asymmetry": 3,
     })
 
 
@@ -61,14 +48,10 @@ class DataConfig:
 class ModelConfig:
     backbone_name: str = "swinv2_base_window12to16_192to256"
     backbone_pretrained: bool = True
-    backbone_img_size: Tuple[int, int] = (928, 352)    # (H, W) — phải khớp data.image_size
+    backbone_img_size: Tuple[int, int] = (928, 352) 
     embed_dim: int = 1024                              # Swin-V2-Base num_features
 
-    # Token grid sau backbone.
-    # Ở 928x352, Swin cho ra 29x11 = 319 token → pool xuống lưới nhỏ để
-    # cross-attention vừa có nghĩa (nhiều hơn 1 token) vừa không nổ VRAM.
-    # Ảnh nhẹ đi 4x nên giờ có thể thử (16, 6) = 96 token nếu VRAM còn dư.
-    # Đặt None = giữ nguyên toàn bộ token.
+    # Token grid 
     token_grid: Tuple[int, int] = (8, 4)               # (H_tok, W_tok) → 32 token/view
 
     # Cross-Attention
@@ -82,107 +65,68 @@ class ModelConfig:
     # MLP Classifier
     mlp_hidden_dim: int = 512
     mlp_dropout: float = 0.3
-    num_classes: int = 4
+    num_classes: int = 3
 
 
 @dataclass
 class TrainConfig:
     # Paths
     output_dir: str = "./outputs"
-    experiment_name: str = "mammo_transformer_v1"
+    experiment_name: str = "mammo_transformer"
 
     # ── Phase 1: contrastive pretrain backbone
     epochs_phase1: int = 50
-    pretrained_phase1: bool = True          # khởi tạo từ ImageNet
-    # Contrastive: batch CÀNG LỚN CÀNG TỐT (negative = 4*(B-1) mỗi anchor).
-    # Đo trên A40 dùng chung ~22 GB. Chạy lại find_batch_size.py nếu GPU trống hơn.
-    batch_size_phase1: int = 12              # 8 bệnh nhân = 32 ảnh/forward, 28 negative
-    # LR cho FULL fine-tune Swin-V2-Base (88M param, unfrozen).
-    # 1e-4 quá cao ở batch này — run trước phân kỳ ở epoch 8 (loss 1.95 → 2.59
-    # rồi không hồi phục). Dải an toàn cho contrastive fine-tune ViT/Swin base
-    # là 2e-5 – 3e-5. Nếu tăng batch_size_phase1 thì scale LR theo căn bậc hai.
+    pretrained_phase1: bool = True          
+    batch_size_phase1: int = 12            
     lr_phase1: float = 2.5e-5
     temperature: float = 0.1
-    # Cách ghép positive cho contrastive loss. CLI: --positives
     #   "patient"     : cả 4 view cùng bệnh nhân là positive (bản gốc)
     #   "ipsilateral" : chỉ cùng bên vú (L_MLO↔L_CC, R_MLO↔R_CC);
     #                   vú đối bên của chính bệnh nhân đó là HARD NEGATIVE
-    # "patient" kéo vú trái và phải lại gần nhau, phá thẳng tín hiệu của lớp
-    # asymmetry — đo được: backbone patient-level thua cả ImageNet ở cả 4 lớp,
-    # asymmetry AUC 0.5418 vs 0.6735. Mặc định đã đổi sang ipsilateral.
+
     contrastive_positives: str = "ipsilateral"
     proj_hidden_dim: int = 2048
     proj_out_dim: int = 128
-    # File checkpoint backbone mà phase 1 ghi ra và phase 2 đọc vào
     phase1_ckpt_name: str = "phase1_backbone.pt"
 
     # ── Phase 2: freeze backbone, train attention + MLP
     epochs_phase2: int = 100
-    # Supervised: batch lớn KHÔNG tốt hơn — nó làm GIẢM số bước cập nhật gradient.
-    # Với ~3400 bệnh nhân train: eff.batch 16 → 212 step/epoch (10.600 step tổng).
-    # Nếu để eff.batch 256 thì chỉ còn 13 step/epoch (650 step) — quá ít để hội tụ.
-    # VRAM cho phép tới batch 64, nhưng ta chỉ dùng phần dư để BỎ accumulation
-    # (nhanh hơn), chứ không tăng effective batch.
     batch_size: int = 16
     accumulate_grad_steps: int = 1          # effective batch = 16
     lr_phase2: float = 3e-4
     # True = nạp backbone từ phase 1. Đặt False để train phase 2 từ ImageNet.
     # CLI: --phase1 / --no-phase1
     load_phase1_backbone: bool = True
-    # Đường dẫn tường minh tới phase1_backbone.pt. "" = suy ra từ
-    # <output_dir>/<experiment_name>/<phase1_ckpt_name>. Cần đến nó khi chạy
-    # ablation với --exp-name khác, vì lúc đó output_dir đã trỏ sang chỗ khác.
+    # Đường dẫn tường minh tới phase1_backbone.pt. ""
     # CLI: --phase1-ckpt
     phase1_ckpt_path: str = ""
 
-    # Fine-tune cả backbone thay vì đóng băng. Chậm hơn nhiều (bật lại
-    # grad-checkpointing). Chỉ nên bật SAU khi head đã hội tụ, nếu không
-    # gradient rác từ head ngẫu nhiên sẽ phá luôn trọng số pretrained.
-    # CLI: --unfreeze-backbone / --backbone-lr-mult
     unfreeze_backbone: bool = False
     backbone_lr_multiplier: float = 0.05    # lr backbone = lr_phase2 * hệ số này
 
-    # Mở backbone TỪNG PHẦN. None = đóng băng hoàn toàn; 2 = chỉ train stage 3+4.
-    # Với Swin-V2-Base, stage 1+2 chỉ giữ 2.3% tham số nhưng chiếm ~60% bộ nhớ
-    # activation (stage 1 có 20.416 token → 90 window, và cosine-attention của
-    # Swin-V2 materialize hẳn ma trận attention thay vì dùng flash attention).
-    # Đóng băng chúng cũng giữ nguyên bộ dò cạnh/kết cấu của ImageNet.
-    # CLI: --unfreeze-from-stage
     unfreeze_from_stage: Optional[int] = None
 
-    # ── SupCon phụ trợ, train CHUNG với FocalLoss (end-to-end 1 pha)
-    # 0 = tắt. Loss tổng = FocalLoss + supcon_weight * MultiLabelSupConLoss.
-    # CẢNH BÁO thang đo: FocalLoss ở đây chạy quanh 0.04 còn SupCon quanh 1-4.
-    # Đặt weight = 1.0 như các paper SupCon (họ ghép với cross-entropy ~0.5-2,
-    # cùng thang) sẽ khiến contrastive át phân loại 25-100 lần. Dải hợp lý:
-    # 0.005 - 0.02. Theo dõi cột `con_ratio` trong log, nên quanh 0.2-0.5.
+    # ── SupCon phụ trợ, train CHUNG với FocalLoss
     # CLI: --supcon-weight
     supcon_weight: float = 0.0
     supcon_temperature: float = 0.1
     supcon_proj_dim: int = 128
     supcon_proj_hidden: int = 512
-    # Loại no_finding khỏi định nghĩa positive. Nếu không, lớp đa số tạo
-    # positive set khổng lồ nuốt hết tín hiệu của calcification/asymmetry.
+    # Loại no_finding khỏi định nghĩa positive. 
     supcon_exclude_no_finding: bool = True
 
     # Optimizer
     weight_decay: float = 1e-2
-    # 100 step (~1/3 epoch) quá ngắn để backbone pretrained thích nghi với
-    # domain mammo. 500 step ≈ 1.8 epoch, êm hơn nhiều.
-    warmup_steps: int = 500                 # tính theo STEP, không phải epoch
+    warmup_steps: int = 500           
     grad_clip: float = 1.0
 
     # Loss
-    focal_alpha: list = field(default_factory=lambda: [0.25, 0.80, 0.85, 0.88])
+    focal_alpha: list = field(default_factory=lambda: [0.25, 0.80, 0.85])
     focal_gamma: float = 2.0
     focal_reduction: str = "mean"
 
     # Misc
     mixed_precision: bool = True
-    # bfloat16 có dải mũ bằng fp32 → không tràn số, không cần GradScaler.
-    # Cần GPU Ampere trở lên (A40/A100/RTX 30xx+). Code tự fallback về fp16
-    # nếu torch.cuda.is_bf16_supported() trả về False.
-    # Đặt False để ép dùng fp16 (chỉ nên dùng khi cần so sánh).
     prefer_bf16: bool = True
     save_top_k: int = 3
     early_stopping_patience: int = 8
@@ -193,12 +137,12 @@ class TrainConfig:
 class WandbConfig:
     enabled: bool = True
     project: str = "mammo-transformer"
-    entity: str = None          # None = dùng account mặc định của bạn
-    run_name_phase1: str = None # None = wandb tự sinh tên
+    entity: str = None          
+    run_name_phase1: str = None 
     run_name_phase2: str = None
     mode: str = "online"        # "online" | "offline" | "disabled"
     log_every_n_steps: int = 20
-    watch_model: bool = False   # True = log gradient/param histogram (chậm hơn)
+    watch_model: bool = False  
 
 
 @dataclass
@@ -209,7 +153,6 @@ class Config:
     wandb: WandbConfig = field(default_factory=WandbConfig)
 
     def to_dict(self) -> dict:
-        """Flatten config → dict phẳng để log lên wandb."""
         from dataclasses import asdict
         out = {}
         for section in ("data", "model", "train"):

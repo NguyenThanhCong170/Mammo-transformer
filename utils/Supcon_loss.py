@@ -7,37 +7,6 @@ import torch.nn.functional as F
 
 
 class MultiViewNTXentLoss(nn.Module):
-    """
-    SupCon / NT-Xent trên nhiều view của cùng bệnh nhân.
-
-    ── Hai chế độ ghép positive ──────────────────────────────────────────
-
-    `view_groups=None`  →  PATIENT-LEVEL (hành vi cũ)
-        Cả 4 view của một bệnh nhân là positive của nhau. 3 positive/anchor.
-
-    `view_groups=[0,0,1,1]`  →  IPSILATERAL-ONLY
-        Chỉ view cùng BÊN vú mới là positive: L_MLO ↔ L_CC, R_MLO ↔ R_CC.
-        Vú đối bên của CHÍNH bệnh nhân đó trở thành NEGATIVE. 1 positive/anchor.
-
-    ── Vì sao cần ipsilateral-only ───────────────────────────────────────
-    Chế độ patient-level huấn luyện backbone làm biểu diễn của vú trái và vú
-    phải cùng một người trở nên GIỐNG NHAU. Nhưng lớp 'asymmetry' được định
-    nghĩa bằng đúng cái KHÁC NHAU giữa hai bên — pretext task đang tối ưu
-    ngược lại với nhiệm vụ đích.
-
-    Đo trên VinDr-Mammo (test, 1000 bệnh nhân): backbone patient-level thua cả
-    khởi tạo ImageNet ở toàn bộ 4 lớp, và tụt mạnh nhất đúng ở asymmetry
-    (AUC 0.5418 vs 0.6735 — về sát mức ngẫu nhiên).
-
-    Ipsilateral-only giữ được tính nhất quán MLO↔CC cùng bên, đồng thời biến
-    vú đối bên thành HARD NEGATIVE — ép mô hình mã hoá khác biệt trái/phải
-    thay vì xoá nó đi.
-
-    ── Lưu ý ─────────────────────────────────────────────────────────────
-    Số negative tỉ lệ với batch_size. Ở chế độ ipsilateral mỗi anchor có
-    (4B - 2) negative thay vì (4B - 4), và 2 trong số đó là hard negative đến
-    từ chính bệnh nhân ấy. Vẫn nên tăng batch_size_phase1 tối đa theo VRAM.
-    """
 
     def __init__(
         self,
@@ -132,13 +101,7 @@ class MultiViewNTXentLoss(nn.Module):
 # Helper: suy ra view_groups từ VIEW_KEYS
 # ──────────────────────────────────────────────────────────────────────────
 def build_view_groups(view_keys: Sequence[str], mode: str) -> Optional[list]:
-    """
-    mode = "patient"      → None (mọi view cùng bệnh nhân là positive)
-    mode = "ipsilateral"  → nhóm theo tiền tố bên vú lấy từ VIEW_KEYS
 
-    Suy ra từ chính VIEW_KEYS thay vì hard-code [0,0,1,1]: nếu thứ tự view
-    trong dataset đổi thì grouping tự đổi theo, không lệch âm thầm.
-    """
     mode = str(mode).strip().lower()
     if mode == "patient":
         return None
@@ -159,30 +122,6 @@ def build_view_groups(view_keys: Sequence[str], mode: str) -> Optional[list]:
 # SupCon cho MULTI-LABEL — dùng ở train_phase2.py (train chung với FocalLoss)
 # ══════════════════════════════════════════════════════════════════════════
 class MultiLabelSupConLoss(nn.Module):
-    """
-    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020) mở rộng cho
-    multi-label, theo biến thể "any-shared-label có trọng số Jaccard".
-
-    Khác hẳn MultiViewNTXentLoss ở trên:
-      - positive = cùng NHÃN BỆNH, bất kể bệnh nhân nào
-      - dùng trong end-to-end một pha, cộng vào FocalLoss
-
-    Đây là điểm sửa cốt lõi so với pretrain 2 pha: pretext task cũ lấy patient
-    ID làm nhãn nên chỉ dạy "nhận diện bệnh nhân". Ở chế độ end-to-end ta đã
-    có nhãn thật, dùng patient ID là tự vứt bỏ thông tin.
-
-    ── Trọng số positive ─────────────────────────────────────────────────
-    w_ij = |y_i ∩ y_j| / |y_i ∪ y_j|   (Jaccard)
-    Hai mẫu không chung nhãn nào → w = 0 (là negative).
-    Trùng nhãn hoàn toàn → w = 1.
-
-    ── exclude_classes ───────────────────────────────────────────────────
-    Mặc định loại lớp 0 (`no_finding`) khỏi phép tính overlap. Nếu không,
-    lớp đa số sẽ tạo một positive set khổng lồ nuốt hết tín hiệu của
-    calcification/asymmetry — vốn chỉ có vài mẫu mỗi batch.
-    Mẫu chỉ mang nhãn no_finding sẽ không có positive nào; chúng vẫn đóng
-    vai trò negative, còn bản thân anchor đó bị bỏ qua khi lấy trung bình.
-    """
 
     def __init__(
         self,

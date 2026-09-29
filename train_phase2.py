@@ -1,11 +1,4 @@
-"""
-PHASE 2 — Freeze backbone (đã contrastive-pretrain ở phase 1),
-train cross-attention + MLP classifier cho multi-label classification.
 
-Chạy:
-    python train_phase1.py     # trước
-    python train_phase2.py     # sau
-"""
 
 import argparse
 import json
@@ -42,7 +35,7 @@ from utils.losses import FocalLoss, MultiLabelMetricsCalculator
 from utils.Supcon_loss import MultiLabelSupConLoss
 from utils.wandb_utils import WandbLogger, flatten_metrics
 
-CLASS_NAMES = ["no_finding", "mass", "calcification", "asymmetry"]
+CLASS_NAMES = ["no_finding", "mass", "calcification"]
 
 
 # ──────────────────────────────────────────────
@@ -143,8 +136,6 @@ def train_one_epoch(
         with autocast(device_type=device.type, enabled=False):
             loss_cls = criterion(logits.float(), labels)
             if use_supcon:
-                # Nhãn theo TỪNG ẢNH, không phải nhãn gộp bệnh nhân — nếu dùng
-                # nhãn gộp thì vú phải khoẻ mạnh cũng bị gán "mass".
                 vl = batch["view_labels"].to(device, non_blocking=True)
                 loss_con = supcon(z.float(), vl.reshape(-1, vl.shape[-1]).float())
                 loss = loss_cls + cfg.train.supcon_weight * loss_con
@@ -572,8 +563,7 @@ Hai model de so sanh (fine-tune stage 3+4, ImageNet init):
   python train_phase2.py --exp-name ft_pure --no-phase1 --unfreeze-from-stage 2 --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --backbone-lr-mult 0.05 --grad-clip 0.5 --epochs 30 --seed 42
 
   # M2 — nhu tren, cong them SupCon
-  python train_phase2.py --exp-name ft_supcon --no-phase1 --unfreeze-from-stage 2 --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --backbone-lr-mult 0.05 --grad-clip 0.5 --epochs 30 --seed 42 --supcon-weight 0.01
-""")
+  python train_phase2.py --exp-name ft_supcon --no-phase1 --unfreeze-from-stage 2 --embed-dim 256 --ffn-expansion 2 --lr 1e-4 --backbone-lr-mult 0.05 --grad-clip 0.5 --epochs 30 --seed 42 --supcon-weight 0.01""")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("--phase1", dest="load_phase1", action="store_true", default=None,
