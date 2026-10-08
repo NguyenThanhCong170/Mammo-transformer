@@ -294,13 +294,13 @@ def main():
     ap.add_argument("--token-w", type=int, default=8)
     # fusion + classifier
     ap.add_argument("--embed-dim", type=int, default=256)
-    ap.add_argument("--num-heads", type=int, default=4)
+    ap.add_argument("--num-heads", type=int, default=2)
     ap.add_argument("--attn-dropout", type=float, default=0.1)
     ap.add_argument("--ffn-dropout", type=float, default=0.1)
-    ap.add_argument("--ipsi-layers", type=int, default=2)
-    ap.add_argument("--bilateral-layers", type=int, default=2)
-    ap.add_argument("--mlp-hidden", type=int, default=512)
-    ap.add_argument("--mlp-dropout", type=float, default=0.3)
+    ap.add_argument("--ipsi-layers", type=int, default=1)
+    ap.add_argument("--bilateral-layers", type=int, default=1)
+    ap.add_argument("--mlp-hidden", type=int, default=256)
+    ap.add_argument("--mlp-dropout", type=float, default=0.5)
     # tối ưu
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--warmup-epochs", type=int, default=2)

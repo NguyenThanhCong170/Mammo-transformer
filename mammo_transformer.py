@@ -370,7 +370,7 @@ class MammoTransformer(nn.Module):
         mlp_hidden_dim: int,
         mlp_dropout: float,
         num_classes: int = 3,
-        token_grid: Optional[Tuple[int, int]] = (8, 4),
+        token_grid: Optional[Tuple[int, int]] = (8, 8),
         ffn_expansion: int = 4,
     ):
         super().__init__()
