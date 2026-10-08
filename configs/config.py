@@ -24,7 +24,7 @@ class DataConfig:
 
     image_ext: str = ".png"
 
-    image_size: Tuple[int, int] = (224, 224)
+    image_size: Tuple[int, int] = (256, 256)
 
     num_workers: int = 4
     persistent_workers: bool = True
