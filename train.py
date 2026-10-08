@@ -15,10 +15,13 @@ Exam thiếu bất kỳ view nào trong 4 view sẽ bị loại (có in số lư
 
 Mixed precision: bf16 autocast (không cần GradScaler). GPU không hỗ trợ bf16 → chạy fp32.
 
+Gradient checkpointing: MẶC ĐỊNH TẮT (train nhanh hơn, tốn VRAM hơn). Bật lại bằng --grad-ckpt.
+
 Chạy:
     python Mammo-resnet101/train_mammo_transformer.py
     python Mammo-resnet101/train_mammo_transformer.py --unfreeze-from 0          # train toàn bộ backbone
     python Mammo-resnet101/train_mammo_transformer.py --backbone-ckpt checkpoints/phase1.pt
+    python Mammo-resnet101/train_mammo_transformer.py --grad-ckpt                # bật lại checkpointing
     python Mammo-resnet101/train_mammo_transformer.py --eval-only
 
 Sau khi train xong, script đánh giá checkpoint tốt nhất trên val và test:
@@ -85,7 +88,7 @@ def build_exams(df, patient_col, study_col, lat_col, view_col):
 
 
 class MammoExamDataset(Dataset):
-    def __init__(self, exams, labels, image_size=(512, 256), is_train=True, aug_level=3):
+    def __init__(self, exams, labels, image_size=(256, 256), is_train=True, aug_level=3):
         self.exams, self.labels = exams, labels
         self.h, self.w = image_size
         self.transform = build_transforms(is_train, aug_level)
@@ -267,6 +270,13 @@ def build_model(args):
         model.unfreeze_backbone_from_stage(args.unfreeze_from)   # 0 = mở hết, 2 = chỉ stage 3+4
     else:
         model.unfreeze_backbone_from_stage(None)                 # đóng băng toàn bộ backbone
+
+    # unfreeze_backbone_from_stage ở trên tự bật lại grad-checkpointing,
+    # nên áp dụng lựa chọn của người dùng SAU các bước trên để ghi đè.
+    model.backbone.set_grad_checkpointing(args.grad_ckpt)
+    n_ckpt = sum(bool(getattr(s, "grad_checkpointing", False)) for s in model.backbone._stages())
+    print(f"[Model] grad-checkpointing: {'BẬT' if n_ckpt else 'TẮT'} "
+          f"({n_ckpt}/{model.backbone.num_stages} stage)")
     return model.to(device)
 
 
@@ -290,6 +300,8 @@ def main():
     ap.add_argument("--backbone-ckpt", default=None, help="backbone đã contrastive-pretrain ở phase 1")
     ap.add_argument("--unfreeze-from", type=int, default=2,
                     help="mở backbone từ stage này (đánh số từ 0): 2 = chỉ stage 3+4, 0 = toàn bộ, -1 = đóng băng hết")
+    ap.add_argument("--grad-ckpt", action="store_true",
+                    help="bật gradient checkpointing (mặc định TẮT: nhanh hơn nhưng tốn VRAM hơn)")
     ap.add_argument("--token-h", type=int, default=8)
     ap.add_argument("--token-w", type=int, default=8)
     # fusion + classifier
