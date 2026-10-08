@@ -16,10 +16,10 @@ class DataConfig:
     #              → prepare_csv.py  → csv_raw
     #              → resize_images.py → data_root + csv_path
     raw_images_dir:      str = "../mammo_data/images_cropped"
-    data_root:           str = "../mammo_data/images_224x224"
+    data_root:           str = "../mammo_data/images_256x256"
     raw_annotations_csv: str = "../mammo_data/finding_annotations.csv"
     csv_raw:             str = "../mammo_data/labels.csv"
-    csv_path:            str = "../mammo_data/labels_224x224.csv"
+    csv_path:            str = "../mammo_data/labels_256x256.csv"
     
 
     image_ext: str = ".png"

@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader, Dataset
 from configs.config import Config, resolve_path
 from data.augmentation import build_transforms
 from data.dataset import birads_to_label, split_patients
-
+# ↓ đổi đường dẫn import này cho đúng với vị trí file chứa MammoTransformer của bạn
 from mammo_transformer import MammoTransformer, VIEW_KEYS
 
 cfg = Config()
@@ -280,7 +280,7 @@ def main():
     ap.add_argument("--study-col", default=None, help="cột mã lần chụp; bỏ trống → 1 bệnh nhân = 1 exam")
     ap.add_argument("--laterality-col", default="laterality")
     ap.add_argument("--view-col", default="view_position")
-    ap.add_argument("--img-h", type=int, default=512)
+    ap.add_argument("--img-h", type=int, default=256)
     ap.add_argument("--img-w", type=int, default=256)
     ap.add_argument("--val-ratio", type=float, default=cfg.data.val_ratio)
     ap.add_argument("--aug-level", type=int, default=cfg.data.aug_level)
@@ -292,10 +292,10 @@ def main():
     ap.add_argument("--unfreeze-from", type=int, default=2,
                     help="mở backbone từ stage này (đánh số từ 0): 2 = chỉ stage 3+4, 0 = toàn bộ, -1 = đóng băng hết")
     ap.add_argument("--token-h", type=int, default=8)
-    ap.add_argument("--token-w", type=int, default=4)
+    ap.add_argument("--token-w", type=int, default=8)
     # fusion + classifier
-    ap.add_argument("--embed-dim", type=int, default=512)
-    ap.add_argument("--num-heads", type=int, default=8)
+    ap.add_argument("--embed-dim", type=int, default=256)
+    ap.add_argument("--num-heads", type=int, default=4)
     ap.add_argument("--attn-dropout", type=float, default=0.1)
     ap.add_argument("--ffn-dropout", type=float, default=0.1)
     ap.add_argument("--ipsi-layers", type=int, default=2)
