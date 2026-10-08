@@ -39,7 +39,7 @@ class SwinV2Backbone(nn.Module):
         pretrained: bool,
         img_size: Tuple[int, int],              # (H, W)
         token_grid: Optional[Tuple[int, int]] = (8, 4),
-        grad_checkpointing: bool = True,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
 
@@ -60,7 +60,7 @@ class SwinV2Backbone(nn.Module):
         self.out_dim = self.backbone.num_features
         # alias cho tiện — nhiều đoạn code cũ gọi .num_features
         self.num_features = self.out_dim
-        self.set_grad_checkpointing(grad_checkpointing)
+        self.set_grad_checkpointing(False)
 
     # ── Truy cập danh sách stage của timm Swin (tên thuộc tính đổi theo version)
     def _stages(self):
@@ -77,14 +77,14 @@ class SwinV2Backbone(nn.Module):
     def num_stages(self) -> int:
         return len(self._stages())
 
-    def set_grad_checkpointing(self, enable: bool = True, only_trainable: bool = True):
+    def set_grad_checkpointing(self, enable: bool = False, only_trainable: bool = True):
         """
         Bật grad-checkpointing. Với only_trainable=True chỉ bật ở những stage
         thực sự có gradient — checkpoint một đoạn không cần grad vừa vô ích vừa
         làm PyTorch cảnh báo "None of the inputs have requires_grad=True".
         """
         try:
-            self.backbone.set_grad_checkpointing(enable)
+            self.backbone.set_grad_checkpointing(False)
         except Exception:
             pass
         if not (enable and only_trainable):
@@ -130,7 +130,7 @@ class SwinV2Backbone(nn.Module):
                     p.requires_grad = True
 
         n_train = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
-        self.set_grad_checkpointing(True)
+        self.set_grad_checkpointing(False)
         return n_train
 
     # ── (B, 3, H, W) → (B, D)
@@ -370,7 +370,7 @@ class MammoTransformer(nn.Module):
         mlp_hidden_dim: int,
         mlp_dropout: float,
         num_classes: int = 3,
-        token_grid: Optional[Tuple[int, int]] = (8, 8),
+        token_grid: Optional[Tuple[int, int]] = (8, 4),
         ffn_expansion: int = 4,
     ):
         super().__init__()
@@ -458,7 +458,7 @@ class MammoTransformer(nn.Module):
 
     def unfreeze_backbone(self):
         self.backbone.unfreeze()
-        self.backbone.set_grad_checkpointing(True)
+        self.backbone.set_grad_checkpointing(False)
         print("[Model] Backbone unfrozen (toan bo).")
 
     def unfreeze_backbone_from_stage(self, stage: Optional[int]):

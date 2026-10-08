@@ -304,7 +304,7 @@ def main():
     # tối ưu
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--warmup-epochs", type=int, default=2)
-    ap.add_argument("--batch-size", type=int, default=8, help="số EXAM mỗi batch (mỗi exam 4 ảnh)")
+    ap.add_argument("--batch-size", type=int, default=32, help="số EXAM mỗi batch (mỗi exam 4 ảnh)")
     ap.add_argument("--lr", type=float, default=1e-4, help="lr của phần fusion/classifier")
     ap.add_argument("--backbone-lr-mult", type=float, default=0.1, help="lr backbone = lr × hệ số này")
     ap.add_argument("--weight-decay", type=float, default=0.05)
