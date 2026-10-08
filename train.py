@@ -13,6 +13,8 @@ Giả định về CSV (đổi bằng tham số nếu tên cột khác):
     view_position: CC / MLO                      (--view-col)
 Exam thiếu bất kỳ view nào trong 4 view sẽ bị loại (có in số lượng).
 
+Mixed precision: bf16 autocast (không cần GradScaler). GPU không hỗ trợ bf16 → chạy fp32.
+
 Chạy:
     python Mammo-resnet101/train_mammo_transformer.py
     python Mammo-resnet101/train_mammo_transformer.py --unfreeze-from 0          # train toàn bộ backbone
@@ -47,6 +49,11 @@ from mammo_transformer import MammoTransformer, VIEW_KEYS
 
 cfg = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# bf16 autocast: cần GPU Ampere trở lên (RTX 30xx, A100...). Không hỗ trợ thì chạy fp32.
+use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+amp_dtype = torch.bfloat16
+print(f"[AMP] {'bf16' if use_amp else 'tắt (fp32)'}")
 
 
 # ──────────────────────────────────────────────
@@ -134,7 +141,7 @@ class BinaryFocalLoss(nn.Module):
         self.alpha, self.gamma = alpha, gamma
 
     def forward(self, logits, targets):
-        logits, targets = logits.float(), targets.float()
+        logits, targets = logits.float(), targets.float()   # luôn tính loss ở fp32
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         p = torch.sigmoid(logits)
         p_t = p * targets + (1 - p) * (1 - targets)
@@ -149,27 +156,19 @@ def to_device(x):
     return {k: v.to(device, non_blocking=True) for k, v in x.items()}
 
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, grad_clip=1.0):
+def train_one_epoch(model, loader, criterion, optimizer, grad_clip=1.0):
     model.train()
     running, total = 0.0, 0
     for x, y in loader:
         x, y = to_device(x), y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, enabled=scaler is not None):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(x)                       # (B, 1)
-        loss = criterion(logits, y)
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+        loss = criterion(logits, y)                 # criterion tự cast logits sang float32
+        loss.backward()
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
         running += loss.item() * y.size(0)
         total += y.size(0)
     return running / max(total, 1)
@@ -181,7 +180,7 @@ def predict(model, loader, criterion):
     probs, ys, running, total = [], [], 0.0, 0
     for x, y in loader:
         x, y = to_device(x), y.to(device, non_blocking=True)
-        with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(x)
         running += criterion(logits, y).item() * y.size(0)
         total += y.size(0)
@@ -350,13 +349,12 @@ def main():
         groups.append({"params": nodec, "lr": g["lr"], "weight_decay": 0.0})
     optimizer = optim.AdamW([g for g in groups if g["params"]])
     scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     best, best_epoch = -float("inf"), 0
 
     for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, args.grad_clip)
+        tr_loss = train_one_epoch(model, train_loader, criterion, optimizer, args.grad_clip)
         va_loss, va_p, va_y = predict(model, val_loader, criterion)
         scheduler.step()
         print(f"Epoch {epoch}/{args.epochs} | train loss {tr_loss:.4f} | val loss {va_loss:.4f}")
