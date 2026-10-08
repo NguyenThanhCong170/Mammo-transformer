@@ -19,10 +19,11 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models
 
-from configs.config import resolve_path
+from configs.config import Config, resolve_path
 from data.augmentation import build_transforms
 from data.dataset import birads_to_label, split_patients
 
+cfg = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -53,7 +54,7 @@ class MammoImageDataset(Dataset):
 
 
 def build_loaders(csv, birads_col, batch_size, num_workers, val_ratio, seed, aug_level):
-    df = pd.read_csv(csv)
+    df = pd.read_csv(resolve_path(csv))   # tương đối theo PROJECT_ROOT, không theo cwd
     df["label"] = df[birads_col].map(birads_to_label).astype(int)
     train_df, val_df, test_df = split_patients(df, val_ratio=val_ratio, seed=seed)
 
@@ -154,21 +155,22 @@ def report(tag, probs, ys, thr):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default="labels_224x224.csv")
+    ap.add_argument("--csv", default=cfg.data.csv_path)
     ap.add_argument("--birads-col", default="finding_birads")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--val-ratio", type=float, default=0.15)
-    ap.add_argument("--aug-level", type=int, default=3)
+    ap.add_argument("--num-workers", type=int, default=cfg.data.num_workers)
+    ap.add_argument("--val-ratio", type=float, default=cfg.data.val_ratio)
+    ap.add_argument("--aug-level", type=int, default=cfg.data.aug_level)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--gamma", type=float, default=2.0)
     ap.add_argument("--alpha", type=float, default=None,
                     help="trọng số lớp abnormal; mặc định = tỉ lệ normal trong train")
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=cfg.data.seed)
     ap.add_argument("--out", default="checkpoints/resnet101_baseline.pt")
     args = ap.parse_args()
+    args.out = str(resolve_path(args.out))   # checkpoint luôn nằm trong PROJECT_ROOT
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 

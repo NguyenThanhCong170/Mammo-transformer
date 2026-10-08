@@ -15,13 +15,13 @@ class DataConfig:
     # ── PIPELINE: crop DICOM → raw_images_dir
     #              → prepare_csv.py  → csv_raw
     #              → resize_images.py → data_root + csv_path
+    raw_images_dir:      str = "../mammo_data/images_cropped"
+    data_root:           str = "../mammo_data/images_224x224"
+    raw_annotations_csv: str = "../mammo_data/finding_annotations.csv"
+    csv_raw:             str = "../mammo_data/labels.csv"
+    csv_path:            str = "../mammo_data/labels_224x224.csv"
     
-    raw_images_dir: str = "images_cropped"      # image after crop dicom
-    data_root: str = "images_224x224"           # image after resize
 
-    raw_annotations_csv: str = "finding_annotations.csv"   
-    csv_raw: str = "labels.csv"                 # csv of image after crop dicom
-    csv_path: str = "labels_224x224.csv"        # csv of image after resize
     image_ext: str = ".png"
 
     image_size: Tuple[int, int] = (224, 224)
